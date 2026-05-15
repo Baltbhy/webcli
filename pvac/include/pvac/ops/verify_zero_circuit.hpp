@@ -187,6 +187,7 @@ inline bool verify_zero(
     const PubKey& pk, const Cipher& ct,
     const ZeroProof& proof
 ) {
+    if (!is_cipher_compatible_with_pubkey(pk, ct)) return false;
     size_t nL = ct.L.size();
     size_t S = ct.slots;
 
@@ -267,6 +268,7 @@ inline bool verify_zero_bound(
     const ZeroProof& proof,
     const RistrettoPoint& amount_commitment
 ) {
+    if (!is_cipher_compatible_with_pubkey(pk, ct)) return false;
     size_t nL = ct.L.size();
     size_t S = ct.slots;
 

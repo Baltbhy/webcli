@@ -47,15 +47,26 @@ pvac_cipher pvac_enc_zero_seeded(pvac_pubkey pk, pvac_seckey sk,
 }
 
 uint64_t pvac_dec_value(pvac_pubkey pk, pvac_seckey sk, pvac_cipher ct) {
-    pvac::Fp r = pvac::dec_value(*PK(pk), *SK(sk), *CT(ct));
-    return r.lo;
+    try {
+        pvac::Fp r = pvac::dec_value(*PK(pk), *SK(sk), *CT(ct));
+        return r.lo;
+    } catch (...) {
+        return 0;
+    }
 }
 
 void pvac_dec_value_fp(pvac_pubkey pk, pvac_seckey sk, pvac_cipher ct,
                        uint64_t* lo_out, uint64_t* hi_out) {
-    pvac::Fp r = pvac::dec_value(*PK(pk), *SK(sk), *CT(ct));
-    *lo_out = r.lo;
-    *hi_out = r.hi;
+    if (!lo_out || !hi_out)
+        return;
+    try {
+        pvac::Fp r = pvac::dec_value(*PK(pk), *SK(sk), *CT(ct));
+        *lo_out = r.lo;
+        *hi_out = r.hi;
+    } catch (...) {
+        *lo_out = 0;
+        *hi_out = 0;
+    }
 }
 
 pvac_cipher pvac_enc_value_fp_seeded(pvac_pubkey pk, pvac_seckey sk,
@@ -134,8 +145,22 @@ pvac_cipher pvac_ct_square_seeded(pvac_pubkey pk, pvac_cipher ct, const uint8_t 
 }
 
 void pvac_commit_ct(pvac_pubkey pk, pvac_cipher ct, uint8_t out[32]) {
+    if (!out)
+        return;
     auto h = pvac::commit_ct(*PK(pk), *CT(ct));
     std::memcpy(out, h.data(), 32);
+}
+
+int pvac_commit_ct_v2(pvac_pubkey pk, pvac_cipher ct, uint8_t *out, size_t out_cap, size_t *out_len) {
+    if (out_len) *out_len = 32;
+    if (!out || out_cap < 32) return -1;
+    try {
+        auto h = pvac::commit_ct(*PK(pk), *CT(ct));
+        std::memcpy(out, h.data(), 32);
+        return 0;
+    } catch (...) {
+        return -2;
+    }
 }
 
 pvac_zero_proof pvac_make_zero_proof(pvac_pubkey pk, pvac_seckey sk, pvac_cipher ct) {
@@ -145,7 +170,11 @@ pvac_zero_proof pvac_make_zero_proof(pvac_pubkey pk, pvac_seckey sk, pvac_cipher
 }
 
 int pvac_verify_zero(pvac_pubkey pk, pvac_cipher ct, pvac_zero_proof proof) {
-    return pvac::verify_zero(*PK(pk), *CT(ct), *ZP(proof)) ? 1 : 0;
+    try {
+        return pvac::verify_zero(*PK(pk), *CT(ct), *ZP(proof)) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
 }
 
 pvac_zero_proof pvac_make_zero_proof_bound(pvac_pubkey pk, pvac_seckey sk, pvac_cipher ct,
@@ -160,14 +189,35 @@ int pvac_verify_zero_bound(pvac_pubkey pk, pvac_cipher ct, pvac_zero_proof proof
                             const uint8_t amount_commitment[32]) {
     pvac::RistrettoPoint commit;
     std::memcpy(commit.data(), amount_commitment, 32);
-    return pvac::verify_zero_bound(*PK(pk), *CT(ct), *ZP(proof), commit) ? 1 : 0;
+    try {
+        return pvac::verify_zero_bound(*PK(pk), *CT(ct), *ZP(proof), commit) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
 }
 
 void pvac_pedersen_commit(uint64_t amount, const uint8_t blinding[32], uint8_t out[32]) {
+    if (!out)
+        return;
     pvac::Scalar val = pvac::bp::sc_from_u64(amount);
     pvac::Scalar blind = pvac::sc_reduce256(blinding);
     pvac::RistrettoPoint pt = pvac::pedersen_commit(val, blind);
     std::memcpy(out, pt.data(), 32);
+}
+
+int pvac_pedersen_commit_v2(uint64_t amount, const uint8_t blinding[32],
+                            uint8_t *out, size_t out_cap, size_t *out_len) {
+    if (out_len) *out_len = 32;
+    if (!out || out_cap < 32) return -1;
+    try {
+        pvac::Scalar val = pvac::bp::sc_from_u64(amount);
+        pvac::Scalar blind = pvac::sc_reduce256(blinding);
+        pvac::RistrettoPoint pt = pvac::pedersen_commit(val, blind);
+        std::memcpy(out, pt.data(), 32);
+        return 0;
+    } catch (...) {
+        return -2;
+    }
 }
 
 pvac_range_proof pvac_make_range_proof(pvac_pubkey pk, pvac_seckey sk,
@@ -178,7 +228,11 @@ pvac_range_proof pvac_make_range_proof(pvac_pubkey pk, pvac_seckey sk,
 }
 
 int pvac_verify_range(pvac_pubkey pk, pvac_cipher ct, pvac_range_proof proof) {
-    return pvac::verify_range(*PK(pk), *CT(ct), *RP(proof)) ? 1 : 0;
+    try {
+        return pvac::verify_range(*PK(pk), *CT(ct), *RP(proof)) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
 }
 
 uint8_t* pvac_serialize_cipher(pvac_cipher ct, size_t* len) {
@@ -307,7 +361,11 @@ pvac_agg_range_proof pvac_make_aggregated_range_proof(pvac_pubkey pk, pvac_secke
 }
 
 int pvac_verify_aggregated_range(pvac_pubkey pk, pvac_cipher ct, pvac_agg_range_proof proof) {
-    return pvac::verify_aggregated_range(*PK(pk), *CT(ct), *ARP(proof)) ? 1 : 0;
+    try {
+        return pvac::verify_aggregated_range(*PK(pk), *CT(ct), *ARP(proof)) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
 }
 
 uint8_t* pvac_serialize_agg_range_proof(pvac_agg_range_proof arp, size_t* len) {

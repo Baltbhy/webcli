@@ -83,6 +83,27 @@ static nlohmann::json g_fee_cache;
 static double g_fee_cache_ts = 0.0;
 static std::mutex g_fee_mtx;
 
+struct HistoryRuntimeState {
+    double last_top_refresh_ts = 0.0;
+    json rejected = json::array();
+    int total = 0;
+    std::unordered_map<std::string, json> pages;
+    std::unordered_map<std::string, double> page_ts;
+};
+
+static std::unordered_map<std::string, HistoryRuntimeState> g_history_runtime;
+static std::mutex g_history_runtime_mtx;
+
+struct TokenHistoryRuntimeState {
+    double ts = 0.0;
+    json rows = json::array();
+    int incoming = 0;
+    int outgoing = 0;
+};
+
+static std::unordered_map<std::string, TokenHistoryRuntimeState> g_token_history_runtime;
+static std::mutex g_token_history_runtime_mtx;
+
 static std::unordered_map<std::string, std::vector<uint8_t>> g_pk_cache;
 static std::mutex g_pk_mtx;
 
@@ -91,6 +112,13 @@ static std::optional<std::vector<uint8_t>> pk_cache_get(const std::string& addr)
     auto it = g_pk_cache.find(addr);
     if (it == g_pk_cache.end()) return std::nullopt;
     return it->second;
+}
+
+static std::string current_public_rpc_url() {
+    if (g_wallet_loaded) return g_wallet.rpc_url;
+    const char* env_rpc = std::getenv("OCTRA_RPC_URL");
+    if (env_rpc && *env_rpc) return env_rpc;
+    return "http://127.0.0.1:8080";
 }
 
 static void pk_cache_put(const std::string& addr, const std::vector<uint8_t>& pk) {
@@ -118,6 +146,120 @@ static double now_ts() {
 
 static json err_json(const std::string& msg) {
     return {{"error", msg}};
+}
+
+static bool tx_status_is_pending_like(const json& tx) {
+    const std::string status = tx.value("status", "pending");
+    return status.empty() || status == "pending";
+}
+
+static json history_tx_from_lookup(const json& lookup, const json& fallback) {
+    json tx = fallback;
+    tx["hash"] = lookup.value("tx_hash", fallback.value("hash", ""));
+    tx["from"] = lookup.value("from", fallback.value("from", ""));
+    tx["to_"] = lookup.value("to", lookup.value("to_", fallback.value("to_", fallback.value("to", ""))));
+    tx["amount_raw"] = lookup.value("amount_raw", lookup.value("amount", fallback.value("amount_raw", "0")));
+    tx["op_type"] = lookup.value("op_type", fallback.value("op_type", "standard"));
+    tx["status"] = lookup.value("status", fallback.value("status", "pending"));
+
+    double ts = fallback.value("timestamp", 0.0);
+    if (lookup.contains("timestamp") && lookup["timestamp"].is_number())
+        ts = lookup["timestamp"].get<double>();
+    else if (lookup.contains("rejected_at") && lookup["rejected_at"].is_number())
+        ts = lookup["rejected_at"].get<double>();
+    tx["timestamp"] = ts;
+
+    if (lookup.contains("message") && lookup["message"].is_string() && !lookup["message"].get<std::string>().empty())
+        tx["message"] = lookup["message"];
+    if (lookup.contains("encrypted_data") && lookup["encrypted_data"].is_string() && !lookup["encrypted_data"].get<std::string>().empty())
+        tx["encrypted_data"] = lookup["encrypted_data"];
+    if (lookup.contains("epoch"))
+        tx["epoch"] = lookup["epoch"];
+    else if (lookup.contains("epoch_id"))
+        tx["epoch"] = lookup["epoch_id"];
+    if (lookup.contains("block_height"))
+        tx["block_height"] = lookup["block_height"];
+
+    if (lookup.contains("error") && lookup["error"].is_object()) {
+        tx["reject_reason"] = lookup["error"].value("reason", "");
+        tx["reject_type"] = lookup["error"].value("type", "");
+    } else {
+        tx.erase("reject_reason");
+        tx.erase("reject_type");
+    }
+    return tx;
+}
+
+static bool reconcile_history_rows(const std::string& addr, json& txs) {
+    if (!txs.is_array() || txs.empty()) return false;
+    std::vector<std::string> methods;
+    std::vector<json> params_list;
+    std::vector<size_t> positions;
+    for (size_t i = 0; i < txs.size(); ++i) {
+        if (!txs[i].is_object() || !tx_status_is_pending_like(txs[i])) continue;
+        const std::string hash = txs[i].value("hash", "");
+        if (hash.empty()) continue;
+        methods.push_back("octra_transaction");
+        params_list.push_back(json::array({hash}));
+        positions.push_back(i);
+    }
+    if (methods.empty()) return false;
+    auto results = g_rpc.call_batch(methods, params_list, 10);
+    bool changed = false;
+    for (size_t i = 0; i < results.size() && i < positions.size(); ++i) {
+        if (!results[i].ok || !results[i].result.is_object()) continue;
+        const std::string status = results[i].result.value("status", "");
+        if (status.empty() || status == "pending") continue;
+        json updated = history_tx_from_lookup(results[i].result, txs[positions[i]]);
+        txs[positions[i]] = updated;
+        if (g_txcache.is_open()) g_txcache.store_tx(addr, updated);
+        changed = true;
+    }
+    return changed;
+}
+
+static HistoryRuntimeState history_runtime_get(const std::string& addr) {
+    std::lock_guard<std::mutex> lk(g_history_runtime_mtx);
+    auto it = g_history_runtime.find(addr);
+    if (it == g_history_runtime.end()) return {};
+    return it->second;
+}
+
+static void history_runtime_put(const std::string& addr, const HistoryRuntimeState& state) {
+    std::lock_guard<std::mutex> lk(g_history_runtime_mtx);
+    g_history_runtime[addr] = state;
+}
+
+static void history_runtime_clear(const std::string& addr) {
+    std::lock_guard<std::mutex> lk(g_history_runtime_mtx);
+    g_history_runtime.erase(addr);
+}
+
+static void history_runtime_clear_all() {
+    std::lock_guard<std::mutex> lk(g_history_runtime_mtx);
+    g_history_runtime.clear();
+}
+
+static std::optional<TokenHistoryRuntimeState> token_history_runtime_get(const std::string& addr) {
+    std::lock_guard<std::mutex> lk(g_token_history_runtime_mtx);
+    auto it = g_token_history_runtime.find(addr);
+    if (it == g_token_history_runtime.end()) return std::nullopt;
+    return it->second;
+}
+
+static void token_history_runtime_put(const std::string& addr, const TokenHistoryRuntimeState& state) {
+    std::lock_guard<std::mutex> lk(g_token_history_runtime_mtx);
+    g_token_history_runtime[addr] = state;
+}
+
+static void token_history_runtime_clear(const std::string& addr) {
+    std::lock_guard<std::mutex> lk(g_token_history_runtime_mtx);
+    g_token_history_runtime.erase(addr);
+}
+
+static void token_history_runtime_clear_all() {
+    std::lock_guard<std::mutex> lk(g_token_history_runtime_mtx);
+    g_token_history_runtime.clear();
 }
 
 static std::string parse_ou(const json& body, const std::string& fallback) {
@@ -217,7 +359,33 @@ static json submit_tx(const octra::Transaction& tx) {
     auto r = g_rpc.submit_tx(j);
     if (!r.ok) return err_json(r.error);
     json res;
-    res["tx_hash"] = r.result.value("tx_hash", "");
+    std::string tx_hash = r.result.value("tx_hash", "");
+    res["tx_hash"] = tx_hash;
+    if (!tx_hash.empty()) {
+        json cached;
+        cached["hash"] = tx_hash;
+        cached["from"] = tx.from;
+        cached["to_"] = tx.to_;
+        cached["amount_raw"] = tx.amount;
+        cached["op_type"] = tx.op_type.empty() ? "standard" : tx.op_type;
+        cached["status"] = "pending";
+        cached["timestamp"] = tx.timestamp;
+        if (!tx.encrypted_data.empty()) cached["encrypted_data"] = tx.encrypted_data;
+        if (!tx.message.empty()) cached["message"] = tx.message;
+        if (g_txcache.is_open()) {
+            bool known = g_txcache.has_tx(tx_hash);
+            g_txcache.store_tx(g_wallet.addr, cached);
+            if (!known) {
+                int cached_total = g_txcache.get_total(g_wallet.addr);
+                g_txcache.set_total(g_wallet.addr, cached_total + 1);
+            }
+        }
+        history_runtime_clear(g_wallet.addr);
+        token_history_runtime_clear(g_wallet.addr);
+    } else {
+        history_runtime_clear(g_wallet.addr);
+        token_history_runtime_clear(g_wallet.addr);
+    }
     return res;
 }
 
@@ -298,12 +466,12 @@ static EncBalResult get_encrypted_balance() {
 }
 
 static void init_wallet_subsystems() {
+    const char* env_rpc = std::getenv("OCTRA_RPC_URL");
+    if (env_rpc && *env_rpc) g_wallet.rpc_url = env_rpc;
     g_rpc.set_url(g_wallet.rpc_url);
-    ensure_pubkey_registered(g_wallet.addr, g_wallet.sk, g_wallet.pub_b64);
     g_pvac_ok = g_pvac.init(g_wallet.priv_b64);
     if (g_pvac_ok) {
         fprintf(stderr, "pvac initialized\n");
-        ensure_pvac_registered();
     } else {
         fprintf(stderr, "pvac init failed (libpvac not loaded?)\n");
     }
@@ -311,6 +479,7 @@ static void init_wallet_subsystems() {
     std::string cache_path = "data/txcache_" + g_wallet.addr.substr(3, 8);
     if (g_txcache.open(cache_path)) {
         fprintf(stderr, "txcache opened: %s\n", cache_path.c_str());
+        g_txcache.ensure_schema("v2_addr_idx_slim_history");
         g_txcache.ensure_rpc(g_wallet.rpc_url);
     } else {
         fprintf(stderr, "txcache open failed: %s\n", cache_path.c_str());
@@ -363,23 +532,33 @@ int main(int argc, char** argv) {
     httplib::Server svr;
     svr.set_read_timeout(300, 0);
     svr.set_write_timeout(300, 0);
-
-
-    //
     svr.set_keep_alive_timeout(5);
     svr.set_keep_alive_max_count(100);
-    //
 
-    svr.set_post_routing_handler([](const httplib::Request&, httplib::Response& res) {
-        res.set_header("X-Frame-Options", "DENY");
+    svr.set_post_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+        bool is_circle_resource = req.path.rfind("/oct/", 0) == 0;
+        if (!is_circle_resource) {
+            res.set_header("X-Frame-Options", "DENY");
+        }
         res.set_header("X-Content-Type-Options", "nosniff");
-        res.set_header("Content-Security-Policy",
-            "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data: https:; "
-            "connect-src 'self' http://127.0.0.1:* http://178.62.60.204:8090 https://*.octra.network https://*.publicnode.com https://*.infura.io wss: ws:; "
-            "frame-ancestors 'none'");
+        if (is_circle_resource) {
+            res.set_header("Content-Security-Policy",
+                "default-src 'self' data: blob:; "
+                "script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: blob: https:; "
+                "connect-src 'none'; "
+                "object-src 'none'; "
+                "base-uri 'self'");
+        } else {
+            res.set_header("Content-Security-Policy",
+                "default-src 'self'; "
+                "script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: https:; "
+                "connect-src 'self' http://127.0.0.1:* http://178.62.60.204:8090 https://*.octra.network https://*.publicnode.com https://*.infura.io wss: ws:; "
+                "frame-ancestors 'none'");
+        }
         res.set_header("Cache-Control", "no-store");
     });
 
@@ -576,7 +755,7 @@ int main(int argc, char** argv) {
             }
             g_pin = pin;
             octra::try_mlock(&g_pin[0], g_pin.size());
-            fprintf(stderr, "wallet created: %s → %s\n", g_wallet.addr.c_str(), g_wallet_path.c_str());
+            fprintf(stderr, "wallet created: %s -> %s\n", g_wallet.addr.c_str(), g_wallet_path.c_str());
             init_wallet_subsystems();
         } catch (const std::exception& e) {
             res.status = 500;
@@ -699,6 +878,7 @@ int main(int argc, char** argv) {
         j["has_master_seed"] = g_wallet.has_master_seed();
         j["hd_index"] = g_wallet.hd_index;
         j["hd_version"] = g_wallet.hd_version;
+        res.set_header("Access-Control-Allow-Origin", "*");
         res.set_content(j.dump(), "application/json");
     });
 
@@ -945,6 +1125,7 @@ int main(int argc, char** argv) {
         }
         if (g_pvac_foreign)
             j["pvac_foreign"] = true;
+        res.set_header("Access-Control-Allow-Origin", "*");
         res.set_content(j.dump(), "application/json");
     });
 
@@ -953,6 +1134,13 @@ int main(int argc, char** argv) {
         int limit = 20, offset = 0;
         if (req.has_param("limit")) limit = std::stoi(req.get_param_value("limit"));
         if (req.has_param("offset")) offset = std::stoi(req.get_param_value("offset"));
+        if (limit < 1) limit = 1;
+        if (limit > 500) limit = 500;
+        if (offset < 0) offset = 0;
+        const std::string addr = g_wallet.addr;
+        const double now = now_ts();
+        const std::string page_key = std::to_string(limit) + ":" + std::to_string(offset);
+        HistoryRuntimeState runtime = history_runtime_get(addr);
 
         auto convert_row = [](const json& row, const std::string& status) -> json {
             json tx;
@@ -960,68 +1148,261 @@ int main(int argc, char** argv) {
             tx["from"] = row.value("from", "");
             tx["to_"] = row.value("to", row.value("to_", ""));
             tx["amount_raw"] = row.value("amount", row.value("amount_raw", "0"));
-            tx["op_type"] = row.value("op_type", "standard");
+            const std::string op_type = row.value("op_type", "standard");
+            tx["op_type"] = op_type;
             tx["status"] = status;
             if (row.contains("timestamp")) tx["timestamp"] = row["timestamp"];
-            if (row.contains("encrypted_data") && row["encrypted_data"].is_string())
-                tx["encrypted_data"] = row["encrypted_data"];
-            if (row.contains("message") && row["message"].is_string())
-                tx["message"] = row["message"];
+            const std::string enc_tag = row.value("encrypted_data", "");
+            if (op_type == "call" && enc_tag == "transfer") {
+                tx["encrypted_data"] = "transfer";
+                if (row.contains("message") && row["message"].is_string())
+                    tx["message"] = row["message"];
+            }
             if (row.contains("reason") && row["reason"].is_string())
                 tx["reject_reason"] = row["reason"];
             return tx;
         };
 
         json txs = json::array();
+        json rejected = json::array();
+        int total = 0;
+        bool served = false;
+
+        auto runtime_page_it = runtime.pages.find(page_key);
+        auto runtime_page_ts_it = runtime.page_ts.find(page_key);
+        const bool runtime_page_present = runtime_page_it != runtime.pages.end();
+        const bool runtime_top_fresh = offset == 0
+            && runtime_page_present
+            && runtime_page_ts_it != runtime.page_ts.end()
+            && (now - runtime_page_ts_it->second) < 10.0;
+        const bool runtime_page_cached = offset > 0 && runtime_page_present;
+        if (runtime_top_fresh || runtime_page_cached) {
+            txs = runtime_page_it->second;
+            rejected = offset == 0 ? runtime.rejected : json::array();
+            total = runtime.total;
+            served = true;
+        }
 
         if (g_txcache.is_open()) {
-            auto r = g_rpc.get_txs_by_address(g_wallet.addr, 1, 0);
-            int node_total = 0;
-            json rejected_buf = json::array();
-            if (r.ok && r.result.is_object()) {
-                node_total = r.result.value("total", 0);
-                if (r.result.contains("rejected"))
-                    for (auto& row : r.result["rejected"])
-                        rejected_buf.push_back(convert_row(row, "rejected"));
-            }
-            int cached = g_txcache.get_total(g_wallet.addr);
-            if (node_total > cached) {
-                int delta = node_total - cached;
-                auto dr = g_rpc.get_txs_by_address(g_wallet.addr, delta, 0);
-                if (dr.ok && dr.result.is_object() && dr.result.contains("transactions")) {
-                    json to_store = json::array();
-                    for (auto& row : dr.result["transactions"]) {
-                        std::string h = row.value("hash", "");
-                        if (!h.empty() && !g_txcache.has_tx(h))
-                            to_store.push_back(convert_row(row, "confirmed"));
-                    }
-                    if (!to_store.empty()) {
-                        g_txcache.store_txs(to_store);
-                        g_txcache.set_total(g_wallet.addr, cached + (int)to_store.size());
-                    }
-                    rejected_buf = json::array();
-                    if (dr.result.contains("rejected"))
-                        for (auto& row : dr.result["rejected"])
-                            rejected_buf.push_back(convert_row(row, "rejected"));
+            const int cached_total = g_txcache.get_total(addr);
+            const bool top_page_fresh = offset == 0
+                && cached_total > 0
+                && (now - runtime.last_top_refresh_ts) < 10.0;
+            const bool page_cached = cached_total > offset;
+            if (!served && ((offset > 0 && page_cached) || top_page_fresh)) {
+                json cached_page = g_txcache.load_page(addr, limit, offset);
+                const bool cached_page_ok = !cached_page.empty() || cached_total == 0;
+                if (cached_page_ok) {
+                    txs = cached_page;
+                    rejected = offset == 0 ? runtime.rejected : json::array();
+                    total = cached_total;
+                    runtime.pages[page_key] = txs;
+                    runtime.page_ts[page_key] = now;
+                    runtime.total = total;
+                    history_runtime_put(addr, runtime);
+                    served = true;
                 }
             }
-            json cached_txs = g_txcache.load_page(limit, offset);
-            for (auto& tx : cached_txs) txs.push_back(tx);
-            for (auto& tx : rejected_buf) txs.push_back(tx);
-        } else {
-            auto r = g_rpc.get_txs_by_address(g_wallet.addr, limit, offset);
-            if (r.ok && r.result.is_object()) {
-                if (r.result.contains("transactions"))
-                    for (auto& row : r.result["transactions"])
-                        txs.push_back(convert_row(row, "confirmed"));
-                if (r.result.contains("rejected"))
-                    for (auto& row : r.result["rejected"])
-                        txs.push_back(convert_row(row, "rejected"));
+            if (!served && page_cached) {
+                txs = g_txcache.load_page(addr, limit, offset);
+                rejected = offset == 0 ? runtime.rejected : json::array();
+                total = cached_total;
+                runtime.pages[page_key] = txs;
+                runtime.page_ts[page_key] = now;
+                runtime.total = total;
+                history_runtime_put(addr, runtime);
+                served = true;
             }
+        }
+        if (!served) {
+            int fetch_limit = limit;
+            if (offset == 0) fetch_limit = std::max(limit, 50);
+            auto fresh = g_rpc.get_txs_by_address(addr, fetch_limit, offset);
+            if (fresh.ok && fresh.result.is_object()) {
+                total = fresh.result.value("total", g_txcache.is_open() ? g_txcache.get_total(addr) : 0);
+                if (total < 0) total = 0;
+                if (fresh.result.contains("transactions")) {
+                    json fetched_rows = json::array();
+                    for (auto& row : fresh.result["transactions"]) {
+                        json converted = convert_row(row, "confirmed");
+                        fetched_rows.push_back(converted);
+                    }
+                    if (g_txcache.is_open()) {
+                        if (!fetched_rows.empty()) g_txcache.store_txs(addr, fetched_rows);
+                        g_txcache.set_total(addr, total);
+                    }
+                    for (int i = 0; i < static_cast<int>(fetched_rows.size()) && i < limit; ++i)
+                        txs.push_back(fetched_rows[i]);
+                }
+                if (fresh.result.contains("rejected"))
+                    for (auto& row : fresh.result["rejected"])
+                        rejected.push_back(convert_row(row, "rejected"));
+                if (offset == 0) {
+                    runtime.last_top_refresh_ts = now;
+                    runtime.rejected = rejected;
+                }
+                runtime.pages[page_key] = txs;
+                runtime.page_ts[page_key] = now;
+                runtime.total = total;
+                history_runtime_put(addr, runtime);
+            }
+        }
+
+        if (reconcile_history_rows(addr, txs)) {
+            runtime.pages[page_key] = txs;
+            runtime.page_ts[page_key] = now;
+            history_runtime_put(addr, runtime);
         }
 
         json j;
         j["transactions"] = txs;
+        j["rejected"] = rejected;
+        j["count"] = txs.size();
+        j["offset"] = offset;
+        j["limit"] = limit;
+        j["total"] = total;
+        j["has_more"] = total > (offset + static_cast<int>(txs.size()));
+        res.set_content(j.dump(), "application/json");
+    });
+
+    svr.Get("/api/token-history", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        int limit = 50, offset = 0;
+        bool force = false;
+        if (req.has_param("limit")) limit = std::stoi(req.get_param_value("limit"));
+        if (req.has_param("offset")) offset = std::stoi(req.get_param_value("offset"));
+        if (req.has_param("force")) {
+            auto v = req.get_param_value("force");
+            force = (v == "1" || v == "true");
+        }
+        if (limit < 1) limit = 1;
+        if (limit > 500) limit = 500;
+        if (offset < 0) offset = 0;
+        const std::string addr = g_wallet.addr;
+        const double now = now_ts();
+
+        auto classify = [&](const json& tx) -> std::pair<bool, bool> {
+            if (tx.value("op_type", "") != "call") return {false, false};
+            if (tx.value("encrypted_data", "") != "transfer") return {false, false};
+            bool incoming = false;
+            try {
+                if (tx.contains("message") && tx["message"].is_string()) {
+                    auto parsed = json::parse(tx["message"].get<std::string>());
+                    if (parsed.is_array() && !parsed.empty() && parsed[0].is_string()) {
+                        std::string recipient = parsed[0].get<std::string>();
+                        if (recipient == addr) incoming = true;
+                    }
+                }
+            } catch (...) {}
+            return {true, incoming};
+        };
+
+        if (!force) {
+            if (auto cached = token_history_runtime_get(addr)) {
+                if (now - cached->ts < 30.0) {
+                    json page = json::array();
+                    for (int i = offset; i < static_cast<int>(cached->rows.size()) && static_cast<int>(page.size()) < limit; ++i)
+                        page.push_back(cached->rows[i]);
+                    json j;
+                    j["transactions"] = page;
+                    j["count"] = page.size();
+                    j["offset"] = offset;
+                    j["limit"] = limit;
+                    j["total"] = cached->rows.size();
+                    j["has_more"] = offset + static_cast<int>(page.size()) < static_cast<int>(cached->rows.size());
+                    j["incoming"] = cached->incoming;
+                    j["outgoing"] = cached->outgoing;
+                    res.set_content(j.dump(), "application/json");
+                    return;
+                }
+            }
+        }
+
+        auto direct = g_rpc.get_token_txs_by_address(addr, limit, offset);
+        if (direct.ok && direct.result.is_object()) {
+            TokenHistoryRuntimeState state;
+            state.ts = now;
+            state.rows = direct.result.value("transactions", json::array());
+            state.incoming = direct.result.value("incoming", 0);
+            state.outgoing = direct.result.value("outgoing", 0);
+            token_history_runtime_put(addr, state);
+            res.set_content(direct.result.dump(), "application/json");
+            return;
+        }
+
+        json rows = json::array();
+        int incoming = 0;
+        int outgoing = 0;
+        std::set<std::string> seen_hashes;
+        std::vector<std::string> token_addrs;
+
+        auto toks = g_rpc.tokens_by_address(addr);
+        if (toks.ok && toks.result.is_array()) {
+            for (auto& tok : toks.result) {
+                if (!tok.is_object()) continue;
+                std::string token_addr = tok.value("address", "");
+                if (!token_addr.empty())
+                    token_addrs.push_back(token_addr);
+            }
+        }
+
+        for (const auto& token_addr : token_addrs) {
+            int batch_offset = 0;
+            bool keep_going = true;
+            while (keep_going) {
+                auto batch = g_rpc.get_txs_by_address(token_addr, 200, batch_offset);
+                if (!batch.ok || !batch.result.is_object()) break;
+                auto txs = batch.result.value("transactions", json::array());
+                for (auto& tx : txs) {
+                    auto [is_token, is_incoming] = classify(tx);
+                    if (!is_token) continue;
+                    std::string tx_token = tx.value("to", tx.value("to_", ""));
+                    if (tx_token != token_addr) continue;
+                    bool is_outgoing = tx.value("from", "") == addr;
+                    if (!is_incoming && !is_outgoing) continue;
+                    std::string hash = tx.value("hash", "");
+                    if (!hash.empty() && !seen_hashes.insert(hash).second) continue;
+                    if (is_incoming) incoming++;
+                    else outgoing++;
+                    rows.push_back(tx);
+                }
+                bool has_more = batch.result.value("has_more", false);
+                if (!has_more || txs.empty()) keep_going = false;
+                batch_offset += static_cast<int>(txs.size());
+                if (batch_offset >= 100000) keep_going = false;
+            }
+        }
+
+        if (!rows.empty()) {
+            std::vector<json> sorted;
+            sorted.reserve(rows.size());
+            for (auto& row : rows) sorted.push_back(row);
+            std::sort(sorted.begin(), sorted.end(), [](const json& a, const json& b) {
+                return a.value("timestamp", 0.0) > b.value("timestamp", 0.0);
+            });
+            rows = json::array();
+            for (const auto& row : sorted) rows.push_back(row);
+        }
+
+        TokenHistoryRuntimeState state;
+        state.ts = now;
+        state.rows = rows;
+        state.incoming = incoming;
+        state.outgoing = outgoing;
+        token_history_runtime_put(addr, state);
+
+        json page = json::array();
+        for (int i = offset; i < static_cast<int>(rows.size()) && static_cast<int>(page.size()) < limit; ++i)
+            page.push_back(rows[i]);
+        json j;
+        j["transactions"] = page;
+        j["count"] = page.size();
+        j["offset"] = offset;
+        j["limit"] = limit;
+        j["total"] = rows.size();
+        j["has_more"] = offset + static_cast<int>(page.size()) < static_cast<int>(rows.size());
+        j["incoming"] = incoming;
+        j["outgoing"] = outgoing;
         res.set_content(j.dump(), "application/json");
     });
 
@@ -1345,7 +1726,7 @@ int main(int argc, char** argv) {
         uint8_t their_vpub[32];
         if (!octra::ed25519_pub_to_x25519(their_signing_pk.data(), their_vpub)) {
             res.status = 400;
-            res.set_content(err_json("ed25519→x25519 conversion failed").dump(), "application/json");
+            res.set_content(err_json("ed25519->x25519 conversion failed").dump(), "application/json");
             return;
         }
         std::vector<uint8_t> their_vpub_raw(their_vpub, their_vpub + 32);
@@ -1677,6 +2058,12 @@ int main(int argc, char** argv) {
             j["reject_reason"] = t["error"].value("reason", "");
             j["reject_type"] = t["error"].value("type", "");
         }
+        if (g_txcache.is_open() && g_wallet_loaded) {
+            const std::string from = j.value("from", "");
+            const std::string to = j.value("to_", "");
+            if (from == g_wallet.addr || to == g_wallet.addr)
+                g_txcache.store_tx(g_wallet.addr, j);
+        }
         res.set_content(j.dump(), "application/json");
     });
 
@@ -1690,11 +2077,17 @@ int main(int argc, char** argv) {
         j["view_pubkey"] = octra::base64_encode(view_pk, 32);
         j["has_master_seed"] = g_wallet.has_master_seed();
         octra::secure_zero(view_sk, 32);
+        res.set_header("Access-Control-Allow-Origin", "*");
         res.set_content(j.dump(), "application/json");
     });
 
     svr.Post("/api/keys/private", [](const httplib::Request& req, httplib::Response& res) {
         WALLET_GUARD
+#ifndef OCTRA_WEBCLI_ENABLE_KEY_EXPORT
+        res.status = 403;
+        res.set_content(err_json("key export is disabled in this build; rebuild with -DOCTRA_WEBCLI_ENABLE_KEY_EXPORT to enable").dump(), "application/json");
+        return;
+#else
         json body;
         try { body = json::parse(req.body); } catch (...) {
             res.status = 400;
@@ -1702,6 +2095,12 @@ int main(int argc, char** argv) {
             return;
         }
         std::string pin = body.value("pin", "");
+        std::string confirm = body.value("confirm", "");
+        if (confirm != "I_UNDERSTAND_KEY_EXPORT_RISK") {
+            res.status = 403;
+            res.set_content(err_json("missing or invalid confirmation; pass confirm=\"I_UNDERSTAND_KEY_EXPORT_RISK\" in body").dump(), "application/json");
+            return;
+        }
         try { octra::load_wallet_encrypted(g_wallet_path, pin); } catch (...) {
             res.status = 403;
             res.set_content(err_json("wrong PIN").dump(), "application/json");
@@ -1710,7 +2109,9 @@ int main(int argc, char** argv) {
         json j;
         j["private_key"] = g_wallet.priv_b64;
         j["mnemonic"] = g_wallet.mnemonic;
+        j["warning"] = "treat these values as plaintext secret; never paste into shared transcripts, screen-shares, or untrusted machines";
         res.set_content(j.dump(), "application/json");
+#endif
     });
 
     svr.Post("/api/contract/compile", [](const httplib::Request& req, httplib::Response& res) {
@@ -2038,6 +2439,7 @@ int main(int argc, char** argv) {
 
     svr.Post("/api/fhe/encrypt", [](const httplib::Request& req, httplib::Response& res) {
         WALLET_GUARD
+        res.set_header("Access-Control-Allow-Origin", "*");
         if (!g_pvac_ok) {
             res.status = 500;
             res.set_content(err_json("pvac not available").dump(), "application/json");
@@ -2055,14 +2457,25 @@ int main(int argc, char** argv) {
         pvac_cipher ct = g_pvac.encrypt(static_cast<uint64_t>(value), seed);
         auto data = g_pvac.serialize_cipher(ct);
         std::string b64 = octra::base64_encode(data.data(), data.size());
+        uint8_t blinding[32];
+        octra::random_bytes(blinding, 32);
+        auto amount_commitment = g_pvac.pedersen_commit(static_cast<uint64_t>(value), blinding);
+        std::string amount_commitment_b64 = octra::base64_encode(amount_commitment.data(), 32);
+        pvac_zero_proof proof = g_pvac.make_zero_proof_bound(ct, static_cast<uint64_t>(value), blinding);
+        std::string zero_proof = g_pvac.encode_zero_proof(proof);
+        g_pvac.free_zero_proof(proof);
         g_pvac.free_cipher(ct);
         json result;
         result["ciphertext"] = b64;
+        result["amount_commitment"] = amount_commitment_b64;
+        result["zero_proof"] = zero_proof;
+        result["proof_kind"] = "bound_zero_v1";
         res.set_content(result.dump(), "application/json");
     });
 
     svr.Post("/api/fhe/decrypt", [](const httplib::Request& req, httplib::Response& res) {
         WALLET_GUARD
+        res.set_header("Access-Control-Allow-Origin", "*");
         if (!g_pvac_ok) {
             res.status = 500;
             res.set_content(err_json("pvac not available").dump(), "application/json");
@@ -2121,6 +2534,236 @@ int main(int argc, char** argv) {
         res.set_content(r.result.dump(), "application/json");
     });
 
+    svr.Get("/api/circle/info", [](const httplib::Request& req, httplib::Response& res) {
+        std::string circle_id = req.get_param_value("circle_id");
+        if (circle_id.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_info(circle_id);
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/asset", [](const httplib::Request& req, httplib::Response& res) {
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string path = req.get_param_value("path");
+        if (circle_id.empty() || path.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and path required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_asset(circle_id, path);
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/asset_ciphertext", [](const httplib::Request& req, httplib::Response& res) {
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string path = req.get_param_value("path");
+        if (circle_id.empty() || path.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and path required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_asset_ciphertext(circle_id, path);
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Get("/api/circle/asset_ciphertext_by_key", [](const httplib::Request& req, httplib::Response& res) {
+        std::string circle_id = req.get_param_value("circle_id");
+        std::string resource_key = req.get_param_value("resource_key");
+        if (circle_id.empty() || resource_key.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id and resource_key required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_asset_ciphertext_by_resource_key(circle_id, resource_key);
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_content(r.result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/deploy", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string runtime = body.value("runtime", "octb");
+        std::string privacy_class = body.value("privacy_class", "sealed");
+        std::string browser_mode = body.value("browser_mode", "native_sealed");
+        std::string resource_mode = body.value("resource_mode", "sealed_read");
+        std::string code_b64 = body.value("code_b64", "");
+        std::string policy_hash = body.value("policy_hash", "");
+        std::string members_root = body.value("members_root", "");
+        std::string export_policy = body.value("export_policy", "");
+        if (circle_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id required").dump(), "application/json");
+            return;
+        }
+        auto read_limit = [&](const char* key, const char* fallback) -> std::string {
+            if (!body.contains("limits") || !body["limits"].is_object()) {
+                return fallback;
+            }
+            auto limits = body["limits"];
+            if (!limits.contains(key)) {
+                return fallback;
+            }
+            if (limits[key].is_string()) {
+                return limits[key].get<std::string>();
+            }
+            if (limits[key].is_number_integer()) {
+                return std::to_string(limits[key].get<long long>());
+            }
+            return fallback;
+        };
+        json payload;
+        payload["runtime"] = runtime;
+        payload["privacy_class"] = privacy_class;
+        payload["browser_mode"] = browser_mode;
+        payload["resource_mode"] = resource_mode;
+        payload["limits"] = {
+            {"max_stable_bytes", read_limit("max_stable_bytes", "33554432")},
+            {"max_assets_bytes", read_limit("max_assets_bytes", "33554432")},
+            {"max_inline_value", read_limit("max_inline_value", "65536")},
+            {"max_wasm_bytes", read_limit("max_wasm_bytes", "33554432")}
+        };
+        if (!code_b64.empty()) payload["code_b64"] = code_b64;
+        if (!policy_hash.empty()) payload["policy_hash"] = policy_hash;
+        if (!members_root.empty()) payload["members_root"] = members_root;
+        if (!export_policy.empty()) payload["export_policy"] = export_policy;
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "200000");
+        tx.timestamp = now_ts();
+        tx.op_type = "deploy_circle";
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        else result["circle_id"] = circle_id;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/asset_encrypted", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string path = body.value("path", "");
+        std::string content_type = body.value("content_type", "");
+        std::string ciphertext_b64 = body.value("ciphertext_b64", "");
+        std::string key_id = body.value("key_id", "");
+        std::string plaintext_hash = body.value("plaintext_hash", "");
+        std::string encoding = body.value("encoding", "");
+        std::string padding_class = body.value("padding_class", "");
+        if (circle_id.empty() || path.empty() || content_type.empty() || ciphertext_b64.empty() || key_id.empty() || plaintext_hash.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id, path, content_type, ciphertext_b64, key_id, and plaintext_hash required").dump(), "application/json");
+            return;
+        }
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "5000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_asset_put_encrypted";
+        tx.encrypted_data = ciphertext_b64;
+        json payload;
+        payload["path"] = path;
+        payload["content_type"] = content_type;
+        payload["key_id"] = key_id;
+        payload["plaintext_hash"] = plaintext_hash;
+        if (!encoding.empty()) payload["encoding"] = encoding;
+        if (!padding_class.empty()) payload["padding_class"] = padding_class;
+        tx.message = payload.dump();
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Get(R"(/oct/([^/]+)(/.*)?)", [](const httplib::Request& req, httplib::Response& res) {
+        std::string circle_id = req.matches.size() > 1 ? req.matches[1].str() : "";
+        std::string raw_path = req.matches.size() > 2 ? req.matches[2].str() : "";
+        std::string path = raw_path.empty() ? "/index.html" : raw_path;
+        if (circle_id.empty()) {
+            res.status = 400;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json("circle_id required").dump(), "application/json");
+            return;
+        }
+        octra::RpcClient rpc(current_public_rpc_url());
+        auto r = rpc.circle_asset(circle_id, path);
+        if (!r.ok) {
+            res.status = 404;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(err_json(r.error).dump(), "application/json");
+            return;
+        }
+        auto content_type = r.result.value("content_type", "application/octet-stream");
+        auto body_b64 = r.result.value("body_b64", "");
+        auto raw = octra::base64_decode(body_b64);
+        std::string body(raw.begin(), raw.end());
+        res.set_header("Access-Control-Allow-Origin", "*");
+        res.set_header("Cache-Control", "no-store");
+        res.set_header("X-Content-Type-Options", "nosniff");
+        res.set_content(body, content_type.c_str());
+    });
+
     svr.Get("/api/contract/receipt", [](const httplib::Request& req, httplib::Response& res) {
         WALLET_GUARD
         std::string hash = req.get_param_value("hash");
@@ -2148,6 +2791,14 @@ int main(int argc, char** argv) {
         if (!g_token_cache.empty() && g_token_cache_addr == g_wallet.addr
             && (now - g_token_cache_ts) < 30.0) {
             res.set_content(g_token_cache.dump(), "application/json");
+            return;
+        }
+        auto fast = g_rpc.tokens_by_address(g_wallet.addr);
+        if (fast.ok && fast.result.contains("tokens")) {
+            g_token_cache = fast.result;
+            g_token_cache_ts = now;
+            g_token_cache_addr = g_wallet.addr;
+            res.set_content(fast.result.dump(), "application/json");
             return;
         }
         auto lr = g_rpc.list_contracts();
@@ -2272,6 +2923,8 @@ int main(int argc, char** argv) {
             if (old_rpc != g_wallet.rpc_url) {
                 g_txcache.clear();
                 g_txcache.put("meta:rpc_url", g_wallet.rpc_url);
+                history_runtime_clear_all();
+                token_history_runtime_clear_all();
                 cache_cleared = true;
                 fprintf(stderr, "txcache cleared: rpc changed %s -> %s\n",
                         old_rpc.c_str(), g_wallet.rpc_url.c_str());

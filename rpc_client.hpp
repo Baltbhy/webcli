@@ -193,6 +193,22 @@ public:
         return call("vm_contract", {addr});
     }
 
+    RpcResult circle_info(const std::string& circle_id) {
+        return call("circle_info", {circle_id}, 10);
+    }
+
+    RpcResult circle_asset(const std::string& circle_id, const std::string& path) {
+        return call("circle_asset", {circle_id, path}, 10);
+    }
+
+    RpcResult circle_asset_ciphertext(const std::string& circle_id, const std::string& path) {
+        return call("circle_asset_ciphertext", {circle_id, path}, 10);
+    }
+
+    RpcResult circle_asset_ciphertext_by_resource_key(const std::string& circle_id, const std::string& resource_key) {
+        return call("circle_asset_ciphertext_by_resource_key", {circle_id, resource_key}, 10);
+    }
+
     RpcResult contract_receipt(const std::string& hash) {
         return call("contract_receipt", {hash});
     }
@@ -206,6 +222,10 @@ public:
 
     RpcResult list_contracts() {
         return call("octra_listContracts", nlohmann::json::array(), 10);
+    }
+
+    RpcResult tokens_by_address(const std::string& addr) {
+        return call("octra_tokensByAddress", {addr}, 15);
     }
 
     RpcResult contract_storage(const std::string& addr, const std::string& key) {
@@ -222,6 +242,10 @@ public:
 
     RpcResult get_txs_by_address(const std::string& addr, int limit = 50, int offset = 0) {
         return call("octra_transactionsByAddress", {addr, limit, offset}, 15);
+    }
+
+    RpcResult get_token_txs_by_address(const std::string& addr, int limit = 50, int offset = 0) {
+        return call("octra_tokenTransfersByAddress", {addr, limit, offset}, 30);
     }
 
     std::vector<RpcResult> call_batch(const std::vector<std::string>& methods,
@@ -300,4 +324,4 @@ private:
     }
 };
 
-} // namespace octra
+}

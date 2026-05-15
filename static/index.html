@@ -114,6 +114,7 @@
   </div>
   <div class="hdr-right-group">
     <div class="right" id="hdr-status">connecting...</div>
+    <button class="right logout-btn" id="hdr-circles" onclick="window.location.href='circles.html'" style="display:none">circles</button>
     <button class="right logout-btn" id="hdr-apps" onclick="switchView('apps')" style="display:none">apps</button>
     <button class="right logout-btn" id="hdr-dev" onclick="switchView('dev')" style="display:none">dev tools</button>
     <button class="right logout-btn" id="hdr-logout" onclick="doLogout()" style="display:none">logout</button>
@@ -141,7 +142,7 @@
       <div class="stat-box"><div class="label">staging</div><div class="value" id="st-staging">-</div></div>
     </div>
     <div class="section">
-      <div class="section-title">recent transactions</div>
+      <div class="section-title">recent transactions (<span id="dash-tx-count">0</span>)</div>
       <div id="dash-txs"><div class="loading">loading...</div></div>
       <div id="dash-more"></div>
     </div>
@@ -277,8 +278,8 @@
       </div>
     </div>
 
-    <div class="section-title">token transactions</div>
-    <div id="tok-txs"><div class="staging-empty">switch to a token to see transactions</div></div>
+    <div class="section-title">token transactions (<span id="tok-tx-count">0</span> / <span id="tok-tx-total">0</span>, in <span id="tok-tx-in">0</span>, out <span id="tok-tx-out">0</span>)</div>
+    <div id="tok-txs"><div class="loading">loading token transactions...</div></div>
   </div>
 
   <div class="view" id="view-apps">
@@ -428,7 +429,7 @@
         <button class="action-btn" onclick="doFheEncrypt()">encrypt</button>
       </div>
       <div class="form-row" id="fhe-enc-result-row" style="display:none">
-        <label>ciphertext (base64) — click to select</label>
+        <label>ciphertext (base64) - click to select</label>
         <textarea id="fhe-enc-output" class="code-editor" rows="3" readonly onclick="this.select()" style="white-space:pre-wrap;word-break:break-all"></textarea>
       </div>
       <div class="form-row">
@@ -479,7 +480,7 @@
   </div>
 
   <div class="view" id="view-history">
-    <div class="section-title">transaction history</div>
+    <div class="section-title">transaction history (<span id="hist-count">0</span> / <span id="hist-total">0</span>)</div>
     <div id="history-list"><div class="loading">loading...</div></div>
     <div id="history-more"></div>
   </div>
@@ -548,6 +549,6 @@
 <div class="footer">octra_wallet | 2026 | alpha ver. - 0.04.10</div>
 
 </div>
-<script src="wallet.js?v=10"></script>
+<script src="wallet.js?v=14"></script>
 </body>
 </html>

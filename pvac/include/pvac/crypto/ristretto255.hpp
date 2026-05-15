@@ -384,9 +384,6 @@ inline Scalar sc_from_fp_signed(const Fp& x) {
 }
 
 inline Scalar sc_random() {
-    uint8_t buf[64];
-    for (int i = 0; i < 64; i++) buf[i] = (uint8_t)(csprng_u64() >> (i % 8 * 8));
-
     uint64_t r[8];
     for (int i = 0; i < 8; i++) r[i] = csprng_u64();
     return sc_reduce512(r);

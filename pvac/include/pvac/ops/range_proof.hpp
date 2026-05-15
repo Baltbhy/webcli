@@ -43,9 +43,6 @@ inline RangeProof make_range_proof(
         for (size_t i = 0; i < RANGE_BITS; ++i) {
             uint64_t b_i = (value >> i) & 1;
             rp.ct_bit[i] = enc_value(pk, sk, b_i);
-
-
-            //!!
             auto ct_b_m1 = ct_sub_const(pk, rp.ct_bit[i], (uint64_t)1);
             uint8_t mul_seed[32];
             for (int k = 0; k < 32; ++k)
@@ -60,8 +57,6 @@ inline RangeProof make_range_proof(
                 rp.ct_bit[i] = enc_value(pk, sk, b_i);
                 auto ct_b_m1 = ct_sub_const(pk, rp.ct_bit[i], (uint64_t)1);
                 uint8_t mul_seed[32];
-
-                // !
                 for (int k = 0; k < 32; ++k)
                     mul_seed[k] = (uint8_t)((i * 37 + k * 13 + 0xA0) & 0xFF);
                 auto ct_check = ct_mul_seeded(pk, rp.ct_bit[i], ct_b_m1, mul_seed);
@@ -109,14 +104,15 @@ inline bool verify_range(
     const Cipher& ct_value,
     const RangeProof& rp
 ) {
+    if (!is_cipher_compatible_with_pubkey(pk, ct_value)) return false;
 
     if (rp.ct_bit.size() != RANGE_BITS) return false;
     if (rp.bit_proofs.size() != RANGE_BITS) return false;
+    for (const auto& ct_bit : rp.ct_bit)
+        if (!is_cipher_compatible_with_pubkey(pk, ct_bit))
+            return false;
 
     unsigned hw = std::thread::hardware_concurrency();
-
-
-    // !
     unsigned n_threads = (hw > 1) ? std::min(hw, (unsigned)RANGE_BITS) : 1;
     std::vector<bool> results(RANGE_BITS, false);
 
@@ -162,7 +158,6 @@ inline bool verify_range(
 
     for (size_t i = 1; i < RANGE_BITS; ++i) {
         Fp power_of_two;
-
         if (i < 64) {
             power_of_two = fp_from_u64(1ULL << i);
         } else {
@@ -182,9 +177,10 @@ inline bool verify_range(
     return true;
 }
 
+
 struct AggregatedRangeProof {
-    std::vector<Cipher> ct_bit;// 64 encrypted bits (needed by verifier)
-    bp::R1CSProof proof; // single R1CS proof covering all 65 circuits
+    std::vector<Cipher> ct_bit;
+    bp::R1CSProof proof;
 };
 
 namespace detail {
@@ -294,6 +290,7 @@ inline AggregatedRangeProof make_aggregated_range_proof(
 
     std::vector<detail::BitPrepData> bit_data(RANGE_BITS);
 
+    // Phase 1: parallel — encrypt bits + compute ct_check + decrypt layers
     unsigned hw = std::thread::hardware_concurrency();
     unsigned n_threads = (hw > 1) ? std::min(hw, (unsigned)RANGE_BITS) : 1;
 
@@ -334,6 +331,7 @@ inline AggregatedRangeProof make_aggregated_range_proof(
                           lc_data.A, lc_data.bases,
                           &lc_data.rinv, &sk);
 
+    // Phase 4: prove
     bp::Transcript transcript("pvac.range_proof.aggregated");
     detail::append_transcript_params(transcript, bit_data, lc_data);
 
@@ -346,7 +344,11 @@ inline bool verify_aggregated_range(
     const Cipher& ct_value,
     const AggregatedRangeProof& arp
 ) {
+    if (!is_cipher_compatible_with_pubkey(pk, ct_value)) return false;
     if (arp.ct_bit.size() != RANGE_BITS) return false;
+    for (const auto& ct_bit : arp.ct_bit)
+        if (!is_cipher_compatible_with_pubkey(pk, ct_bit))
+            return false;
 
     std::vector<detail::BitPrepData> vdata(RANGE_BITS);
     for (size_t i = 0; i < RANGE_BITS; ++i) {
@@ -394,6 +396,7 @@ inline bool verify_aggregated_range(
         }
         v_offset += nB * S;
     }
+
     {
         size_t nB = lc_data.bases.size();
         size_t S = ct_lc_diff.slots;

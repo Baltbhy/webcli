@@ -25,7 +25,6 @@
               2025-2026 Julia L.
 */
 
-
 #pragma once
 #include <string>
 #include <vector>
@@ -73,6 +72,17 @@ public:
         }
     }
 
+    void ensure_schema(const std::string& schema) {
+        auto stored = get("meta:schema");
+        if (stored != schema) {
+            if (!stored.empty())
+                fprintf(stderr, "txcache: schema mismatch (%s != %s), clearing\n",
+                        stored.c_str(), schema.c_str());
+            clear();
+            put("meta:schema", schema);
+        }
+    }
+
     void put(const std::string& key, const std::string& val) {
         if (db_) db_->Put(leveldb::WriteOptions(), key, val);
     }
@@ -92,39 +102,40 @@ public:
         put("total:" + addr, std::to_string(total));
     }
 
-    void store_tx(const nlohmann::json& tx) {
+    void store_tx(const std::string& addr, const nlohmann::json& tx) {
         std::string hash = tx.value("hash", "");
-        if (hash.empty()) return;
+        if (hash.empty() || addr.empty()) return;
         put("tx:" + hash, tx.dump());
         double ts = tx.value("timestamp", 0.0);
         char idx[128];
-        snprintf(idx, sizeof(idx), "idx:%020.6f:%s", 9999999999.0 - ts, hash.c_str());
+        snprintf(idx, sizeof(idx), "idx:%s:%020.6f:%s", addr.c_str(), 9999999999.0 - ts, hash.c_str());
         put(idx, hash);
     }
 
-    void store_txs(const nlohmann::json& txs) {
+    void store_txs(const std::string& addr, const nlohmann::json& txs) {
         if (!db_) return;
         leveldb::WriteBatch batch;
         for (auto& tx : txs) {
             std::string hash = tx.value("hash", "");
-            if (hash.empty()) continue;
+            if (hash.empty() || addr.empty()) continue;
             batch.Put("tx:" + hash, tx.dump());
             double ts = tx.value("timestamp", 0.0);
-            char idx[128];
-            snprintf(idx, sizeof(idx), "idx:%020.6f:%s", 9999999999.0 - ts, hash.c_str());
+            char idx[192];
+            snprintf(idx, sizeof(idx), "idx:%s:%020.6f:%s", addr.c_str(), 9999999999.0 - ts, hash.c_str());
             batch.Put(idx, hash);
         }
         db_->Write(leveldb::WriteOptions(), &batch);
     }
 
-    nlohmann::json load_page(int limit, int offset) {
+    nlohmann::json load_page(const std::string& addr, int limit, int offset) {
         nlohmann::json result = nlohmann::json::array();
-        if (!db_) return result;
+        if (!db_ || addr.empty()) return result;
+        std::string prefix = "idx:" + addr + ":";
         auto it = db_->NewIterator(leveldb::ReadOptions());
         int pos = 0;
-        for (it->Seek("idx:"); it->Valid(); it->Next()) {
+        for (it->Seek(prefix); it->Valid(); it->Next()) {
             auto k = it->key().ToString();
-            if (k.substr(0, 4) != "idx:") break;
+            if (k.compare(0, prefix.size(), prefix) != 0) break;
             if (pos < offset) { pos++; continue; }
             auto hash = it->value().ToString();
             std::string val;
@@ -138,12 +149,13 @@ public:
         return result;
     }
 
-    int count_idx() {
-        if (!db_) return 0;
+    int count_idx(const std::string& addr) {
+        if (!db_ || addr.empty()) return 0;
+        std::string prefix = "idx:" + addr + ":";
         int n = 0;
         auto it = db_->NewIterator(leveldb::ReadOptions());
-        for (it->Seek("idx:"); it->Valid(); it->Next()) {
-            if (it->key().ToString().substr(0, 4) != "idx:") break;
+        for (it->Seek(prefix); it->Valid(); it->Next()) {
+            if (it->key().ToString().compare(0, prefix.size(), prefix) != 0) break;
             n++;
         }
         delete it;

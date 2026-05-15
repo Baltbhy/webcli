@@ -117,14 +117,357 @@ var _compiledAbi = null;
 var _fees = {};
 var _rpcHost = '';
 var _hasMasterSeed = false;
+var _addressRuntime = {};
+var _tokenMetaInflight = {};
+var HISTORY_CACHE_TTL_MS = 12000;
+var HISTORY_STALE_REFRESH_MS = 3000;
+var BALANCE_CACHE_TTL_MS = 5000;
+var TOKEN_CACHE_TTL_MS = 15000;
+var TOKEN_STALE_REFRESH_MS = 3000;
+var PERSISTED_CACHE_TTL_MS = 300000;
+
+function ensureAddressRuntime(addr) {
+  if (!addr) return null;
+  if (!_addressRuntime[addr]) {
+    _addressRuntime[addr] = {
+      balance: null,
+      balanceTs: 0,
+      balanceInflight: null,
+      historyPages: {},
+      historyTs: {},
+      historyInflight: {},
+      tokens: [],
+      tokensLoaded: false,
+      tokensTs: 0,
+      tokensInflight: null,
+      tokenHistory: null,
+      tokenHistoryTs: 0,
+      tokenHistoryInflight: null
+    };
+  }
+  return _addressRuntime[addr];
+}
+
+function clearAddressRuntime(addr) {
+  if (!addr) return;
+  delete _addressRuntime[addr];
+}
+
+function clearAllAddressRuntime() {
+  _addressRuntime = {};
+  _tokenMetaInflight = {};
+}
+
+function persistedCachePrefix(addr) {
+  return 'octra_webcli:v2:' + (_rpcHost || 'rpc') + ':' + addr + ':';
+}
+
+function persistedRead(key) {
+  try {
+    var raw = sessionStorage.getItem(key);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+function persistedWrite(key, value) {
+  try {
+    sessionStorage.setItem(key, JSON.stringify(value));
+  } catch (e) {}
+}
+
+function persistedRemovePrefix(prefix) {
+  try {
+    for (var i = sessionStorage.length - 1; i >= 0; i--) {
+      var key = sessionStorage.key(i);
+      if (key && key.indexOf(prefix) === 0) sessionStorage.removeItem(key);
+    }
+  } catch (e) {}
+}
+
+function persistBalance(addr, balance) {
+  if (!addr || !balance) return;
+  persistedWrite(persistedCachePrefix(addr) + 'balance', {
+    ts: Date.now(),
+    balance: balance
+  });
+}
+
+function restorePersistedBalance(addr) {
+  if (!addr) return null;
+  var cached = persistedRead(persistedCachePrefix(addr) + 'balance');
+  if (!cached || !cached.balance || !cached.ts) return null;
+  if ((Date.now() - cached.ts) > PERSISTED_CACHE_TTL_MS) return null;
+  return cached.balance;
+}
+
+function persistHistoryPage(addr, limit, offset, response) {
+  if (!addr || !response) return;
+  persistedWrite(persistedCachePrefix(addr) + 'history:' + historyPageKey(limit, offset), {
+    ts: Date.now(),
+    response: response
+  });
+}
+
+function restorePersistedHistoryPage(addr, limit, offset) {
+  if (!addr) return null;
+  var cached = persistedRead(persistedCachePrefix(addr) + 'history:' + historyPageKey(limit, offset));
+  if (!cached || !cached.response || !cached.ts) return null;
+  if ((Date.now() - cached.ts) > PERSISTED_CACHE_TTL_MS) return null;
+  return cached;
+}
+
+function persistTokens(addr, tokens) {
+  if (!addr) return;
+  persistedWrite(persistedCachePrefix(addr) + 'tokens', {
+    ts: Date.now(),
+    tokens: tokens || []
+  });
+}
+
+function persistTokenHistory(addr, payload) {
+  if (!addr || !payload) return;
+  persistedWrite(persistedCachePrefix(addr) + 'token-history', {
+    ts: Date.now(),
+    payload: payload
+  });
+}
+
+function restorePersistedTokens(addr) {
+  if (!addr) return null;
+  var cached = persistedRead(persistedCachePrefix(addr) + 'tokens');
+  if (!cached || !cached.ts || !Array.isArray(cached.tokens)) return null;
+  if ((Date.now() - cached.ts) > PERSISTED_CACHE_TTL_MS) return null;
+  return cached;
+}
+
+function restorePersistedTokenHistory(addr) {
+  if (!addr) return null;
+  var cached = persistedRead(persistedCachePrefix(addr) + 'token-history');
+  if (!cached || !cached.ts || !cached.payload) return null;
+  if ((Date.now() - cached.ts) > PERSISTED_CACHE_TTL_MS) return null;
+  return cached;
+}
+
+function dropPersistedAddressRuntime(addr) {
+  if (!addr) return;
+  persistedRemovePrefix(persistedCachePrefix(addr));
+}
+
+function dropAllPersistedRuntime() {
+  persistedRemovePrefix('octra_webcli:');
+}
+
+function historyPageKey(limit, offset) {
+  return String(limit) + ':' + String(offset);
+}
+
+function peekHistoryPage(addr, limit, offset) {
+  var state = ensureAddressRuntime(addr);
+  if (!state) return null;
+  var key = historyPageKey(limit, offset);
+  if (!state.historyPages[key]) {
+    var persisted = restorePersistedHistoryPage(addr, limit, offset);
+    if (persisted) {
+      state.historyPages[key] = persisted.response;
+      state.historyTs[key] = persisted.ts;
+    }
+  }
+  if (!state.historyPages[key]) return null;
+  return {
+    response: state.historyPages[key],
+    ts: state.historyTs[key] || 0
+  };
+}
+
+function cacheHistoryPage(addr, limit, offset, response) {
+  var state = ensureAddressRuntime(addr);
+  if (!state) return response;
+  var key = historyPageKey(limit, offset);
+  state.historyPages[key] = response;
+  state.historyTs[key] = Date.now();
+  persistHistoryPage(addr, limit, offset, response);
+  return response;
+}
+
+async function reconcileHistoryResponse(addr, limit, offset, response) {
+  if (!addr || !response || !Array.isArray(response.transactions) || response.transactions.length === 0) {
+    return response;
+  }
+  var pending = [];
+  for (var i = 0; i < response.transactions.length; i++) {
+    var tx = response.transactions[i];
+    if (!tx || !tx.hash) continue;
+    var st = tx.status || 'pending';
+    if (st === 'pending') pending.push({ index: i, hash: tx.hash });
+  }
+  if (pending.length === 0) return response;
+  var nextTxs = response.transactions.slice();
+  var changed = false;
+  await Promise.all(pending.map(async function(entry) {
+    try {
+      var fresh = await api('GET', '/tx?hash=' + encodeURIComponent(entry.hash));
+      var st = fresh.status || 'pending';
+      if (!st || st === 'pending') return;
+      var merged = Object.assign({}, nextTxs[entry.index], fresh);
+      merged.hash = fresh.hash || nextTxs[entry.index].hash || entry.hash;
+      merged.to_ = fresh.to_ || fresh.to || nextTxs[entry.index].to_ || nextTxs[entry.index].to || '';
+      merged.amount_raw = fresh.amount_raw || fresh.amount || nextTxs[entry.index].amount_raw || '0';
+      merged.status = st;
+      nextTxs[entry.index] = merged;
+      changed = true;
+    } catch (e) {}
+  }));
+  if (!changed) return response;
+  var nextResponse = Object.assign({}, response, { transactions: nextTxs });
+  cacheHistoryPage(addr, limit, offset, nextResponse);
+  return nextResponse;
+}
+
+async function fetchHistoryPage(limit, offset, force) {
+  var addr = _walletAddr;
+  if (!addr) return { transactions: [] };
+  var state = ensureAddressRuntime(addr);
+  var key = historyPageKey(limit, offset);
+  var cached = peekHistoryPage(addr, limit, offset);
+  if (!force && cached && (Date.now() - cached.ts) < HISTORY_CACHE_TTL_MS) {
+    return reconcileHistoryResponse(addr, limit, offset, cached.response);
+  }
+  if (state.historyInflight[key]) return state.historyInflight[key];
+  state.historyInflight[key] = api('GET', '/history?limit=' + limit + '&offset=' + offset)
+    .then(function(response) {
+      return cacheHistoryPage(addr, limit, offset, response);
+    })
+    .then(function(response) {
+      return reconcileHistoryResponse(addr, limit, offset, response);
+    })
+    .finally(function() {
+      delete state.historyInflight[key];
+    });
+  return state.historyInflight[key];
+}
+
+function cacheAddressTokens(addr, tokens) {
+  var state = ensureAddressRuntime(addr);
+  if (!state) return;
+  state.tokens = tokens || [];
+  state.tokensLoaded = true;
+  state.tokensTs = Date.now();
+  persistTokens(addr, state.tokens);
+}
+
+function restoreAddressTokens(addr) {
+  var state = ensureAddressRuntime(addr);
+  if (!state) return false;
+  if (!state.tokensLoaded) {
+    var persisted = restorePersistedTokens(addr);
+    if (persisted) {
+      state.tokens = persisted.tokens.slice();
+      state.tokensLoaded = true;
+      state.tokensTs = persisted.ts;
+    }
+  }
+  if (!state.tokensLoaded) return false;
+  _tokens = state.tokens.slice();
+  _tokensLoaded = true;
+  hydrateTokenMaps(_tokens);
+  return true;
+}
+
+function hydrateTokenMaps(tokens) {
+  for (var i = 0; i < tokens.length; i++) {
+    _tokenSymbols[tokens[i].address] = tokens[i].symbol;
+    _tokenDecimals[tokens[i].address] = tokens[i].decimals || '0';
+  }
+}
+
+function tokenHistorySummary(payload) {
+  return {
+    transactions: (payload && payload.transactions) ? payload.transactions : [],
+    total: (payload && payload.total) ? payload.total : 0,
+    incoming: (payload && payload.incoming) ? payload.incoming : 0,
+    outgoing: (payload && payload.outgoing) ? payload.outgoing : 0,
+    has_more: !!(payload && payload.has_more)
+  };
+}
+
+async function fetchAddressTokens(force) {
+  var addr = _walletAddr;
+  if (!addr) return [];
+  var state = ensureAddressRuntime(addr);
+  if (!state) return [];
+  if (!force && state.tokensLoaded && (Date.now() - state.tokensTs) < TOKEN_CACHE_TTL_MS) {
+    return state.tokens.slice();
+  }
+  if (state.tokensInflight) return state.tokensInflight;
+  state.tokensInflight = api('GET', '/tokens')
+    .then(function(res) {
+      var tokens = (res && res.tokens) ? res.tokens : [];
+      cacheAddressTokens(addr, tokens);
+      return tokens.slice();
+    })
+    .finally(function() {
+      state.tokensInflight = null;
+    });
+  return state.tokensInflight;
+}
+
+async function fetchTokenHistory(force) {
+  var addr = _walletAddr;
+  if (!addr) return tokenHistorySummary(null);
+  var state = ensureAddressRuntime(addr);
+  if (!state) return tokenHistorySummary(null);
+  if (!force && state.tokenHistory && (Date.now() - state.tokenHistoryTs) < HISTORY_CACHE_TTL_MS) {
+    return state.tokenHistory;
+  }
+  if (!force && !state.tokenHistory) {
+    var persisted = restorePersistedTokenHistory(addr);
+    if (persisted) {
+      var summary = tokenHistorySummary(persisted.payload);
+      var hasTokens = state.tokensLoaded && state.tokens && state.tokens.length > 0;
+      if (!(hasTokens && summary.total === 0)) {
+        state.tokenHistory = summary;
+        state.tokenHistoryTs = persisted.ts;
+        return state.tokenHistory;
+      }
+    }
+  }
+  if (state.tokenHistoryInflight) return state.tokenHistoryInflight;
+  var suffix = force ? '&force=1' : '';
+  state.tokenHistoryInflight = api('GET', '/token-history?limit=200&offset=0' + suffix)
+    .then(function(response) {
+      var summary = tokenHistorySummary(response);
+      state.tokenHistory = summary;
+      state.tokenHistoryTs = Date.now();
+      persistTokenHistory(addr, summary);
+      return summary;
+    })
+    .finally(function() {
+      state.tokenHistoryInflight = null;
+    });
+  return state.tokenHistoryInflight;
+}
+
+function invalidateCurrentAddressState() {
+  if (!_walletAddr) return;
+  dropPersistedAddressRuntime(_walletAddr);
+  clearAddressRuntime(_walletAddr);
+  ensureAddressRuntime(_walletAddr);
+  _cachedBal = null;
+  _historyOffset = 0;
+  _tokens = [];
+  _tokensLoaded = false;
+}
 
 
-var _ideProject = null;  // { id, name, created, template }
-var _ideFiles = {};       // { path: content }
+var _ideProject = null;
+var _ideFiles = {};
 var _ideActiveFile = null;
 var _ideOpenTabs = [];
 var _ideSaveTimer = null;
-var _ideMode = false;     // false=single file, true=project mode
+var _ideMode = false;
 
 var ProjectStore = (function() {
   var DB_NAME = 'octra_ide';
@@ -787,37 +1130,66 @@ async function bgStealthScan() {
   } catch (e) {}
 }
 
-async function fetchBalance() {
-  try {
-    var bal = await api('GET', '/balance');
-    _cachedBal = bal;
-    var pub = bal.public_balance || '0';
-    var enc = bal.encrypted_balance || '0';
-    _encryptedBalanceRaw = parseInt(enc) || 0;
-    var MAX_SANE_ENC = 100000000 * 1000000;
-    var encCorrupt = (_encryptedBalanceRaw < 0 || _encryptedBalanceRaw > MAX_SANE_ENC);
-    if (encCorrupt) _encryptedBalanceRaw = 0;
-    if ($('btn-key-switch')) $('btn-key-switch').style.display = encCorrupt ? '' : 'none';
-    if ($('st-balance')) $('st-balance').textContent = fmtOct(pub);
-    if ($('st-enc-balance')) $('st-enc-balance').textContent = encCorrupt
-        ? 'corrupted ciphertext' : fmtOct(enc);
-    if ($('st-nonce')) $('st-nonce').textContent = bal.nonce || '0';
-    if ($('st-staging')) $('st-staging').textContent = bal.staging || '0';
-    if ($('send-bal')) $('send-bal').textContent = fmtOct(pub);
-    if ($('enc-pub-bal')) $('enc-pub-bal').textContent = fmtOct(pub);
-    if ($('enc-enc-bal')) $('enc-enc-bal').textContent = encCorrupt
-        ? 'corrupted ciphertext' : fmtOct(enc);
-    if ($('st-enc-bal-info')) $('st-enc-bal-info').textContent = encCorrupt
-        ? 'corrupted ciphertext' : fmtOct(enc);
-    if ($('ct-bal')) $('ct-bal').textContent = fmtOct(pub);
-    $('hdr-status').textContent = _rpcHost ? 'online | ' + networkLabel(_rpcHost) : 'online';
-    $('hdr-status').className = 'right online';
-    return bal;
-  } catch (e) {
-    $('hdr-status').textContent = 'offline';
-    $('hdr-status').className = 'right error';
-    return null;
+function applyBalanceData(bal) {
+  _cachedBal = bal;
+  var pub = bal.public_balance || '0';
+  var enc = bal.encrypted_balance || '0';
+  _encryptedBalanceRaw = parseInt(enc) || 0;
+  var MAX_SANE_ENC = 100000000 * 1000000;
+  var encCorrupt = (_encryptedBalanceRaw < 0 || _encryptedBalanceRaw > MAX_SANE_ENC);
+  if (encCorrupt) _encryptedBalanceRaw = 0;
+  if ($('btn-key-switch')) $('btn-key-switch').style.display = encCorrupt ? '' : 'none';
+  if ($('st-balance')) $('st-balance').textContent = fmtOct(pub);
+  if ($('st-enc-balance')) $('st-enc-balance').textContent = encCorrupt
+      ? 'corrupted ciphertext' : fmtOct(enc);
+  if ($('st-nonce')) $('st-nonce').textContent = bal.nonce || '0';
+  if ($('st-staging')) $('st-staging').textContent = bal.staging || '0';
+  if ($('send-bal')) $('send-bal').textContent = fmtOct(pub);
+  if ($('enc-pub-bal')) $('enc-pub-bal').textContent = fmtOct(pub);
+  if ($('enc-enc-bal')) $('enc-enc-bal').textContent = encCorrupt
+      ? 'corrupted ciphertext' : fmtOct(enc);
+  if ($('st-enc-bal-info')) $('st-enc-bal-info').textContent = encCorrupt
+      ? 'corrupted ciphertext' : fmtOct(enc);
+  if ($('ct-bal')) $('ct-bal').textContent = fmtOct(pub);
+  $('hdr-status').textContent = _rpcHost ? 'online | ' + networkLabel(_rpcHost) : 'online';
+  $('hdr-status').className = 'right online';
+}
+
+async function fetchBalance(force) {
+  var state = ensureAddressRuntime(_walletAddr);
+  if (state && state.balanceInflight) return state.balanceInflight;
+  if (!force && state && state.balance && (Date.now() - state.balanceTs) < BALANCE_CACHE_TTL_MS) {
+    applyBalanceData(state.balance);
+    return state.balance;
   }
+  if (!force && state && !state.balance) {
+    var persisted = restorePersistedBalance(_walletAddr);
+    if (persisted) {
+      state.balance = persisted;
+      state.balanceTs = Date.now();
+      applyBalanceData(persisted);
+    }
+  }
+  var request = api('GET', '/balance')
+    .then(function(bal) {
+      if (state) {
+        state.balance = bal;
+        state.balanceTs = Date.now();
+      }
+      persistBalance(_walletAddr, bal);
+      applyBalanceData(bal);
+      return bal;
+    })
+    .catch(function() {
+      $('hdr-status').textContent = 'offline';
+      $('hdr-status').className = 'right error';
+      return null;
+    })
+    .finally(function() {
+      if (state) state.balanceInflight = null;
+    });
+  if (state) state.balanceInflight = request;
+  return request;
 }
 
 async function api(method, path, body) {
@@ -1034,8 +1406,8 @@ function opTag(op) {
 function statusTag(st) {
   if (st === 'confirmed') return '<span class="private-tag">confirmed</span>';
   if (st === 'rejected') return '<span class="stealth-tag">rejected</span>';
-  if (st === 'pending') return '<span class="pending-tag">pending</span>';
-  return '<span class="pending-tag">' + escapeHtml(st || 'pending') + '</span>';
+  if (st === 'pending') return '<span class="pending-text">pending</span>';
+  return '<span class="pending-text">' + escapeHtml(st || 'pending') + '</span>';
 }
 
 function showResult(elId, ok, msg) {
@@ -1094,8 +1466,8 @@ function clearDecryptLog() {
 function txStatusTag(st) {
   if (st === 'rejected') return '<span class="rejected-tag">rejected</span>';
   if (st === 'confirmed') return '<span class="confirmed-tag">confirmed</span>';
-  if (st === 'pending') return '<span class="pending-tag">pending</span>';
-  return '<span class="pending-tag">' + escapeHtml(st || 'pending') + '</span>';
+  if (st === 'pending') return '<span class="pending-text">pending</span>';
+  return '<span class="pending-text">' + escapeHtml(st || 'pending') + '</span>';
 }
 
 function txAmt(tx) {
@@ -1207,6 +1579,7 @@ function dashTxLimit() {
 }
 
 function renderDashTxs(txs) {
+  $('dash-tx-count').textContent = String(txs.length);
   var h = '<table class="desktop-table"><tr><th>hash</th><th>from</th><th>to</th><th class="col-amount">amount</th><th class="col-status">status</th><th class="col-time">time</th></tr>';
   var cards = '<div class="card-list">';
   for (var i = 0; i < txs.length; i++) {
@@ -1220,13 +1593,27 @@ function renderDashTxs(txs) {
 }
 
 async function loadDashboard() {
-  await fetchBalance();
+  fetchBalance(false);
   loadTokenSymbols();
   try {
     var lim = dashTxLimit();
-    var hist = await api('GET', '/history?limit=' + lim + '&offset=0');
+    var cached = peekHistoryPage(_walletAddr, lim, 0);
+    if (cached) {
+      var cachedTxs = cached.response.transactions || [];
+      if (cachedTxs.length === 0) {
+        $('dash-tx-count').textContent = '0';
+        $('dash-txs').innerHTML = '<div class="staging-empty">no transactions yet</div>';
+        $('dash-more').innerHTML = '';
+      } else {
+        renderDashTxs(cachedTxs);
+        fetchMissingSymbols(cachedTxs).then(function() { renderDashTxs(cachedTxs); });
+      }
+      if ((Date.now() - cached.ts) <= HISTORY_STALE_REFRESH_MS) return;
+    }
+    var hist = await fetchHistoryPage(lim, 0, false);
     var txs = hist.transactions || [];
     if (txs.length === 0) {
+      $('dash-tx-count').textContent = '0';
       $('dash-txs').innerHTML = '<div class="staging-empty">no transactions yet</div>';
       $('dash-more').innerHTML = '';
       return;
@@ -1234,6 +1621,7 @@ async function loadDashboard() {
     renderDashTxs(txs);
     fetchMissingSymbols(txs).then(function() { renderDashTxs(txs); });
   } catch (e) {
+    $('dash-tx-count').textContent = '0';
     $('dash-txs').innerHTML = '<div class="staging-empty">no transactions yet</div>';
     $('dash-more').innerHTML = '';
   }
@@ -1258,6 +1646,7 @@ async function doSend() {
     if (fee) body.ou = fee;
     var res = await api('POST', '/send', body);
     var txHash = res.hash || res.tx_hash || '';
+    invalidateCurrentAddressState();
     showResult('send-result', true, 'sent ' + amount + ' oct - tx: ' + txLink(txHash));
     $('send-to').value = '';
     $('send-amount').value = '';
@@ -1298,6 +1687,7 @@ async function doKeySwitch() {
     try {
       var res = await api('POST', '/key_switch', {});
       var txHash = res.hash || res.tx_hash || '';
+      invalidateCurrentAddressState();
       var h2 = '<div class="result-msg result-ok" style="margin:20px 0;word-break:break-all">key switch submitted</div>';
       h2 += '<div style="margin:12px 0;font-size:13px">tx: ' + txLinkExt(txHash) + '</div>';
       h2 += '<div class="action-row"><button class="action-btn" id="ks-close">close</button></div>';
@@ -1320,6 +1710,7 @@ async function doEncrypt() {
     if (encFee) encBody.ou = encFee;
     var res = await api('POST', '/encrypt', encBody);
     var txHash = res.hash || res.tx_hash || '';
+    invalidateCurrentAddressState();
     showResult('enc-result', true, 'encrypted ' + amount + ' oct - tx: ' + txLink(txHash));
       $('enc-amount').value = '';
     loadDashboard();
@@ -1346,6 +1737,7 @@ async function doDecrypt() {
     var decFee = $('dec-fee') ? $('dec-fee').value.trim() : '';
     if (decFee) decBody.ou = decFee;
     var res = await api('POST', '/decrypt', decBody);
+    invalidateCurrentAddressState();
     if (res.steps) {
       for (var i = 0; i < res.steps.length; i++) logDecrypt(res.steps[i], 'log-info');
     }
@@ -1389,6 +1781,7 @@ async function doStealthSend() {
     var stFee = $('stealth-fee') ? $('stealth-fee').value.trim() : '';
     if (stFee) stBody.ou = stFee;
     var res = await api('POST', '/stealth/send', stBody);
+    invalidateCurrentAddressState();
     if (res.steps) {
       for (var i = 0; i < res.steps.length; i++) logStealth(res.steps[i], 'log-info');
     }
@@ -1470,6 +1863,7 @@ async function doStealthClaim(ids) {
   logStealth('claiming ' + ids.length + ' output(s)...', 'log-info');
   try {
     var res = await api('POST', '/stealth/claim', { ids: ids });
+    invalidateCurrentAddressState();
     logStealth('claim complete', 'log-ok');
     if (res.results) {
       for (var i = 0; i < res.results.length; i++) {
@@ -1851,6 +2245,7 @@ async function doDeploy() {
     var res = await api('POST', '/contract/deploy', body);
     var addr = res.contract_address || '';
     var hash = res.tx_hash || '';
+    invalidateCurrentAddressState();
     showResult('ct-deploy-result', true,
       'deployed to <span class="mono">' + escapeHtml(addr) + '</span> - tx: ' + txLink(hash) + ' (verifying source...)');
     $('ct-call-addr').value = addr;
@@ -1895,8 +2290,9 @@ async function doContractCall() {
     if (callFee) callBody.ou = callFee;
     var res = await api('POST', '/contract/call', callBody);
     var hash = res.tx_hash || '';
+    invalidateCurrentAddressState();
     showResult('ct-call-result', true, 'call submitted - tx: ' + txLink(hash));
-    consoleLog('event', 'call ' + method + '() → tx ' + (hash ? hash.slice(0,16) + '...' : ''));
+    consoleLog('event', 'call ' + method + '() -> tx ' + (hash ? hash.slice(0,16) + '...' : ''));
     loadDashboard();
   } catch (e) {
     showResult('ct-call-result', false, e.message);
@@ -1955,10 +2351,10 @@ async function doContractView() {
       showResult('ct-call-result', true,
         'result (encrypted): <span class="mono">' + escapeHtml(String(val)).substring(0, 40) + '...</span>' +
         '<br>decrypted: <span class="mono" style="color:#0f0;font-size:1.1em">' + decrypted + '</span>');
-      consoleLog('log', 'view ' + method + '() → ' + decrypted + ' (decrypted)');
+      consoleLog('log', 'view ' + method + '() -> ' + decrypted + ' (decrypted)');
     } else {
       showResult('ct-call-result', true, 'result: <span class="mono">' + escapeHtml(String(val)) + '</span>');
-      consoleLog('log', 'view ' + method + '() → ' + String(val));
+      consoleLog('log', 'view ' + method + '() -> ' + String(val));
     }
     if (res.storage) updateStorageView(res.storage);
     if (res.events && res.events.length > 0) {
@@ -2057,15 +2453,13 @@ async function doVerifyContract() {
 }
 
 async function loadTokenSymbols() {
-  if (_tokensLoaded) return;
+  var cached = restoreAddressTokens(_walletAddr);
+  var state = ensureAddressRuntime(_walletAddr);
+  if (cached && state && (Date.now() - state.tokensTs) <= TOKEN_STALE_REFRESH_MS) return;
   try {
-    var res = await api('GET', '/tokens');
-    _tokens = res.tokens || [];
+    _tokens = await fetchAddressTokens(false);
     _tokensLoaded = true;
-    for (var i = 0; i < _tokens.length; i++) {
-      _tokenSymbols[_tokens[i].address] = _tokens[i].symbol;
-      _tokenDecimals[_tokens[i].address] = _tokens[i].decimals || '0';
-    }
+    hydrateTokenMaps(_tokens);
   } catch(e) {}
 }
 
@@ -2081,31 +2475,80 @@ async function fetchMissingSymbols(txs) {
   var unknowns = Object.keys(need);
   if (unknowns.length === 0) return;
   await Promise.all(unknowns.map(function(ca) {
-    return Promise.all([
+    if (_tokenMetaInflight[ca]) return _tokenMetaInflight[ca];
+    _tokenMetaInflight[ca] = Promise.all([
       api('GET', '/contract-storage?address=' + encodeURIComponent(ca) + '&key=symbol').then(function(r) {
         if (r && r.value) _tokenSymbols[ca] = String(r.value).slice(0, 32);
       }).catch(function() {}),
       api('GET', '/contract-storage?address=' + encodeURIComponent(ca) + '&key=decimals').then(function(r) {
         if (r && r.value) _tokenDecimals[ca] = String(r.value);
       }).catch(function() {})
-    ]);
+    ]).finally(function() {
+      delete _tokenMetaInflight[ca];
+    });
+    return _tokenMetaInflight[ca];
   }));
 }
 
 async function loadTokens() {
   $('tok-list').innerHTML = '<div class="loading">loading tokens...</div>';
-  try {
-    var res = await api('GET', '/tokens');
-    _tokens = res.tokens || [];
-    _tokensLoaded = true;
-    for (var i = 0; i < _tokens.length; i++) {
-      _tokenSymbols[_tokens[i].address] = _tokens[i].symbol;
-      _tokenDecimals[_tokens[i].address] = _tokens[i].decimals || '0';
-    }
+  var restored = restoreAddressTokens(_walletAddr);
+  var state = ensureAddressRuntime(_walletAddr);
+  if (restored) {
     renderTokenList();
-    loadTokenTxs();
+    if (state && (Date.now() - state.tokensTs) <= TOKEN_STALE_REFRESH_MS) {
+      loadTokenTxs();
+      return;
+    }
+  }
+  try {
+    _tokens = await fetchAddressTokens(false);
+    _tokensLoaded = true;
+    hydrateTokenMaps(_tokens);
   } catch (e) {
-    $('tok-list').innerHTML = '<div class="error-box">' + e.message + '</div>';
+    if (!restored) $('tok-list').innerHTML = '<div class="error-box">' + e.message + '</div>';
+    loadTokenTxs();
+    return;
+  }
+  renderTokenList();
+  loadTokenTxs();
+}
+
+async function loadTokenTxs() {
+  var el = $('tok-txs');
+  if (!el) return;
+  var gen = ++_tokTxGen;
+  try {
+    var hist = await fetchTokenHistory(false);
+    if ((!hist.total || hist.total === 0) && _tokens && _tokens.length > 0) {
+      hist = await fetchTokenHistory(true);
+    }
+    if (gen !== _tokTxGen) return;
+    var filtered = hist.transactions || [];
+    $('tok-tx-count').textContent = String(filtered.length);
+    $('tok-tx-total').textContent = String(hist.total || filtered.length);
+    $('tok-tx-in').textContent = String(hist.incoming || 0);
+    $('tok-tx-out').textContent = String(hist.outgoing || 0);
+    if (filtered.length === 0) {
+      el.innerHTML = '<div class="staging-empty">no token transactions yet</div>';
+      return;
+    }
+    await fetchMissingSymbols(filtered);
+    var h = '<table class="desktop-table"><tr><th>hash</th><th>from</th><th>to</th><th class="col-amount">amount</th><th class="col-status">status</th><th class="col-time">time</th></tr>';
+    var cards = '<div class="card-list">';
+    for (var j = 0; j < filtered.length; j++) {
+      h += txRow(filtered[j]);
+      cards += txCardHtml(filtered[j]);
+    }
+    h += '</table>';
+    cards += '</div>';
+    el.innerHTML = h + cards;
+  } catch(e) {
+    $('tok-tx-count').textContent = '0';
+    $('tok-tx-total').textContent = '0';
+    $('tok-tx-in').textContent = '0';
+    $('tok-tx-out').textContent = '0';
+    el.innerHTML = '<div class="staging-empty">no token transactions yet</div>';
   }
 }
 
@@ -2187,6 +2630,7 @@ async function doTokenTransfer() {
     if (tokFee) tokBody.ou = tokFee;
     var res = await api('POST', '/token/transfer', tokBody);
     var txHash = res.hash || res.tx_hash || '';
+    invalidateCurrentAddressState();
     showResult('tok-transfer-result', true,
       'sent ' + humanAmt + ' ' + _selectedToken.symbol + ' - tx: ' + txLink(txHash));
     $('tok-to').value = '';
@@ -2197,39 +2641,8 @@ async function doTokenTransfer() {
   }
 }
 
-async function loadTokenTxs() {
-  var el = $('tok-txs');
-  if (!el) return;
-  var gen = ++_tokTxGen;
-  try {
-    var filtered = [];
-    var hist = await api('GET', '/history?limit=500&offset=0');
-    if (gen !== _tokTxGen) return;
-    var txs = hist.transactions || [];
-    for (var i = 0; i < txs.length; i++) {
-      var t = txs[i];
-      if (t.op_type === 'call' && t.encrypted_data === 'transfer') filtered.push(t);
-    }
-    if (filtered.length === 0) {
-      el.innerHTML = '<div class="staging-empty">no token transactions yet</div>';
-      return;
-    }
-    await fetchMissingSymbols(filtered);
-    var h = '<table class="desktop-table"><tr><th>hash</th><th>from</th><th>to</th><th class="col-amount">amount</th><th class="col-status">status</th><th class="col-time">time</th></tr>';
-    var cards = '<div class="card-list">';
-    for (var i = 0; i < filtered.length; i++) {
-      h += txRow(filtered[i]);
-      cards += txCardHtml(filtered[i]);
-    }
-    h += '</table>';
-    cards += '</div>';
-    el.innerHTML = h + cards;
-  } catch(e) {
-    el.innerHTML = '<div class="staging-empty">no token transactions yet</div>';
-  }
-}
-
 function renderHistoryTxs(txs) {
+  $('hist-count').textContent = String(_historyOffset + txs.length);
   var h = '<table class="desktop-table"><tr><th>hash</th><th>from</th><th>to</th><th class="col-amount">amount</th><th class="col-status">status</th><th class="col-time">time</th></tr>';
   var cards = '<div class="card-list">';
   for (var i = 0; i < txs.length; i++) {
@@ -2242,22 +2655,41 @@ function renderHistoryTxs(txs) {
 }
 
 async function loadHistory() {
-  $('history-list').innerHTML = '<div class="loading">loading...</div>';
+  var cached = peekHistoryPage(_walletAddr, _historyLimit, _historyOffset);
+  if (!cached) $('history-list').innerHTML = '<div class="loading">loading...</div>';
   $('history-more').innerHTML = '';
   loadTokenSymbols();
   try {
-    var res = await api('GET', '/history?limit=' + _historyLimit + '&offset=' + _historyOffset);
+    if (cached) {
+      var cachedTxs = cached.response.transactions || [];
+      $('hist-total').textContent = String(cached.response.total || cachedTxs.length);
+      if (cachedTxs.length === 0 && _historyOffset === 0) {
+        $('hist-count').textContent = '0';
+        $('history-list').innerHTML = '<div class="staging-empty">no transactions yet</div>';
+      } else {
+        renderHistoryTxs(cachedTxs);
+        if (cached.response.has_more) {
+          $('history-more').innerHTML = '<button class="load-more" onclick="loadMoreHistory()">load more</button>';
+        }
+        fetchMissingSymbols(cachedTxs).then(function() { renderHistoryTxs(cachedTxs); });
+      }
+      if ((Date.now() - cached.ts) <= HISTORY_STALE_REFRESH_MS) return;
+    }
+    var res = await fetchHistoryPage(_historyLimit, _historyOffset, false);
     var txs = res.transactions || [];
+    $('hist-total').textContent = String(res.total || txs.length);
     if (txs.length === 0 && _historyOffset === 0) {
+      $('hist-count').textContent = '0';
       $('history-list').innerHTML = '<div class="staging-empty">no transactions yet</div>';
       return;
     }
     renderHistoryTxs(txs);
-    if (txs.length >= _historyLimit) {
+    if (res.has_more) {
       $('history-more').innerHTML = '<button class="load-more" onclick="loadMoreHistory()">load more</button>';
     }
     fetchMissingSymbols(txs).then(function() { renderHistoryTxs(txs); });
   } catch (e) {
+    $('hist-count').textContent = '0';
     $('history-list').innerHTML = '<div class="error-box">' + e.message + '</div>';
   }
 }
@@ -2271,8 +2703,9 @@ async function loadHistoryAppend() {
   var btn = $('history-more').querySelector('button');
   if (btn) { btn.disabled = true; btn.textContent = 'loading...'; }
   try {
-    var res = await api('GET', '/history?limit=' + _historyLimit + '&offset=' + _historyOffset);
+    var res = await fetchHistoryPage(_historyLimit, _historyOffset, false);
     var txs = res.transactions || [];
+    $('hist-total').textContent = String(res.total || txs.length);
     if (txs.length === 0) {
       $('history-more').innerHTML = '<div class="staging-empty">no more transactions</div>';
       return;
@@ -2286,7 +2719,26 @@ async function loadHistoryAppend() {
       }
       if (cardList) cardList.insertAdjacentHTML('beforeend', txCardHtml(txs[i]));
     }
-    if (txs.length >= _historyLimit) {
+    fetchMissingSymbols(txs).then(function() {
+      if (tbl) {
+        for (var j = 0; j < txs.length; j++) {
+          var rowIndex = tbl.rows.length - txs.length + j;
+          if (rowIndex > 0 && tbl.rows[rowIndex]) tbl.rows[rowIndex].innerHTML = txRow(txs[j]).replace(/<\/?tr>/g, '');
+        }
+      }
+      if (cardList) {
+        var all = $('history-list').querySelector('.card-list');
+        if (all) {
+          var cards = all.querySelectorAll('.tx-card');
+          for (var k = 0; k < txs.length; k++) {
+            var cardIndex = cards.length - txs.length + k;
+            if (cardIndex >= 0 && cards[cardIndex]) cards[cardIndex].outerHTML = txCardHtml(txs[k]);
+          }
+        }
+      }
+    });
+    $('hist-count').textContent = String(_historyOffset + txs.length);
+    if (res.has_more) {
       $('history-more').innerHTML = '<button class="load-more" onclick="loadMoreHistory()">load more</button>';
     } else {
       $('history-more').innerHTML = '';
@@ -2539,6 +2991,8 @@ async function doSaveSettings() {
     if (explorer) _explorerUrl = explorer.replace(/\/+$/, '');
     try { _rpcHost = new URL(rpc).hostname; } catch(e) { _rpcHost = rpc; }
     if (resp && resp.cache_cleared) {
+      clearAllAddressRuntime();
+      dropAllPersistedRuntime();
       _cachedBal = null;
       _historyOffset = 0;
       _tokens = [];
@@ -2551,7 +3005,7 @@ async function doSaveSettings() {
       fetchBalance();
       if (document.querySelector('.nav-tabs a.active[data-view="dashboard"]'))
         loadDashboard();
-      showResult('settings-result', true, 'saved · cache cleared');
+      showResult('settings-result', true, 'saved | cache cleared');
     } else {
       showResult('settings-result', true, 'saved');
     }
@@ -2807,13 +3261,23 @@ async function modalFinishSetup() {
 async function loadWalletInfo() {
   try {
     var w = await api('GET', '/wallet');
+    var prevAddr = _walletAddr;
     _walletAddr = w.address || w.addr || '';
+    ensureAddressRuntime(_walletAddr);
+    if (prevAddr !== _walletAddr) {
+      _cachedBal = null;
+      _historyOffset = 0;
+      _tokens = [];
+      _tokensLoaded = false;
+      restoreAddressTokens(_walletAddr);
+    }
     if (w.explorer_url) _explorerUrl = w.explorer_url.replace(/\/+$/, '');
     if (w.rpc_url) try { _rpcHost = new URL(w.rpc_url).hostname; } catch(e) { _rpcHost = w.rpc_url; }
     _hasMasterSeed = !!w.has_master_seed;
     $('hdr-addr').innerHTML = '<span class="mono">' + _walletAddr + '</span>';
     $('hdr-logout').style.display = '';
     $('hdr-dev').style.display = '';
+    $('hdr-circles').style.display = '';
     $('hdr-apps').style.display = '';
     fetchFees();
     loadDashboard();
@@ -2827,12 +3291,18 @@ async function loadWalletInfo() {
 async function doLogout() {
   try { await api('POST', '/wallet/lock', {}); } catch (e) {}
   if (_refreshTimer) { clearInterval(_refreshTimer); _refreshTimer = null; }
+  clearAllAddressRuntime();
   _walletAddr = '';
   _cachedBal = null;
   _encryptedBalanceRaw = 0;
   _hasMasterSeed = false;
+  _tokens = [];
+  _tokensLoaded = false;
+  _tokenSymbols = {};
+  _tokenDecimals = {};
   $('hdr-logout').style.display = 'none';
   $('hdr-dev').style.display = 'none';
+  $('hdr-circles').style.display = 'none';
   $('hdr-apps').style.display = 'none';
   $('hdr-addr').textContent = 'locked';
   $('hdr-status').textContent = 'locked';
@@ -2845,11 +3315,15 @@ function startRefreshTimer() {
   if (_refreshTimer) return;
   bgStealthScan();
   _refreshTimer = setInterval(function() {
-    fetchBalance();
+    fetchBalance(true);
     bgStealthScan();
     fetchFees();
     var dash = $('view-dashboard');
+    var tok = $('view-tokens');
+    var hist = $('view-history');
     if (dash && dash.classList.contains('active')) loadDashboard();
+    if (tok && tok.classList.contains('active')) loadTokens();
+    if (hist && hist.classList.contains('active') && _historyOffset === 0) loadHistory();
   }, 15000);
 }
 
@@ -2868,7 +3342,7 @@ function showAccountPicker(wallets) {
     var sub = hasAddr
       ? a.addr.substring(0, 12) + '...' + a.addr.substring(a.addr.length - 6)
       : a.file;
-    var hdTag = a.hd ? ' · hd' : '';
+    var hdTag = a.hd ? ' | hd' : '';
     var dataAttr = hasAddr
       ? 'data-addr="' + a.addr + '"'
       : 'data-file="' + a.file + '"';

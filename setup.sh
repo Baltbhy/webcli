@@ -7,8 +7,8 @@ for arg in "$@"; do
         --deps-only|--no-build) MODE="deps" ;;
         --help|-h)
             echo "usage: $0 [--deps-only]"
-            echo "(no args) install deps + build"
-            echo "--deps-only install deps only (no make)"
+            echo "  (no args)     install deps + build"
+            echo "  --deps-only   install deps only (no make)"
             exit 0
             ;;
     esac
@@ -106,7 +106,7 @@ case "$OS" in
         if [ "$MODE" = "deps" ]; then
             echo "[1/1] detected windows shell ($OS) in deps-only mode"
             echo "on windows, dependencies should be installed via setup.bat from cmd.exe"
-            echo "if you already ran setup.bat, this is fine — continuing"
+            echo "if you already ran setup.bat, this is fine - continuing"
             exit 0
         fi
         echo "detected windows shell ($OS). run setup.bat from cmd.exe instead."

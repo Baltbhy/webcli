@@ -125,13 +125,17 @@ public:
 
     std::array<uint8_t, 32> commit_ct(pvac_cipher ct) {
         std::array<uint8_t, 32> out;
-        pvac_commit_ct(pk_, ct, out.data());
+        size_t out_len = 0;
+        int rc = pvac_commit_ct_v2(pk_, ct, out.data(), out.size(), &out_len);
+        if (rc != 0 || out_len != out.size()) throw std::runtime_error("pvac_commit_ct_v2 failed");
         return out;
     }
 
     std::array<uint8_t, 32> pedersen_commit(uint64_t amount, const uint8_t blinding[32]) {
         std::array<uint8_t, 32> out;
-        pvac_pedersen_commit(amount, blinding, out.data());
+        size_t out_len = 0;
+        int rc = pvac_pedersen_commit_v2(amount, blinding, out.data(), out.size(), &out_len);
+        if (rc != 0 || out_len != out.size()) throw std::runtime_error("pvac_pedersen_commit_v2 failed");
         return out;
     }
 

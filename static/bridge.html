@@ -243,20 +243,48 @@ body{font-family:Tahoma,arial,sans-serif;background:#F0F2F5;color:#2B3A52;min-he
 </div>
 
 <script>
-var BRIDGE_VAULT = 'oct5MrNfjiXFNRDLwsodn8Zm9hDKNGAYt3eQDCQ52bSpCHq';
-var WOCT_ADDR = '0x4647e1fE715c9e23959022C2416C71867F5a6E80';
-var ETH_BRIDGE = '0xE7eD69b852fd2a1406080B26A37e8E04e7dA4caE';
-var SIGNER_URL = '/api/bridge/signer';
-var RECOVERY_URL = 'https://relayer-002838819188.octra.network/recovery.json';
-var SEPOLIA_CHAIN_ID = '0xaa36a7';
-var OCT_DECIMALS = 6;
+const BRIDGE_VAULT = 'oct5MrNfjiXFNRDLwsodn8Zm9hDKNGAYt3eQDCQ52bSpCHq';
+const WOCT_ADDR = '0x4647e1fE715c9e23959022C2416C71867F5a6E80';
+const ETH_BRIDGE = '0xE7eD69b852fd2a1406080B26A37e8E04e7dA4caE';
+const SIGNER_URL = '/api/bridge/signer';
+const RECOVERY_URL = 'https://relayer-002838819188.octra.network/recovery.json';
+const MAINNET_CHAIN_ID = '0x1';
+const ETHEREUM_MAINNET_PARAMS = {
+  chainId: MAINNET_CHAIN_ID,
+  chainName: 'Ethereum Mainnet',
+  nativeCurrency: {
+    name: 'Ether',
+    symbol: 'ETH',
+    decimals: 18
+  },
+  rpcUrls: ['https://ethereum-rpc.publicnode.com'],
+  blockExplorerUrls: ['https://etherscan.io']
+};
+const ETH_CHAIN_NAMES = {
+  '0x1': 'Ethereum Mainnet',
+  '0x2105': 'Base',
+  '0xa4b1': 'Arbitrum One',
+  '0xa': 'Optimism',
+  '0x89': 'Polygon',
+  '0x38': 'BSC',
+  '0xa86a': 'Avalanche',
+  '0xfa': 'Fantom',
+  '0x144': 'zkSync',
+  '0xaa36a7': 'Sepolia',
+  '0xaa37dc': 'OP Sepolia',
+  '0x14a34': 'Base Sepolia',
+  '0x66eee': 'Arbitrum Sepolia'
+};
+const OCT_DECIMALS = 6;
 
-var _dir = 'o2e';
-var _octraAddr = '';
-var _ethAddr = '';
-var _octBalance = '0';
-var _woctBalance = '0';
-var _ethProvider = null;
+let _currentChainId = null;
+
+let _dir = 'o2e';
+let _octraAddr = '';
+let _ethAddr = '';
+let _octBalance = '0';
+let _woctBalance = '0';
+let _ethProvider = null;
 
 async function wcli(method, path, body) {
   var opts = { method: method, headers: {} };
@@ -325,10 +353,83 @@ async function selectWallet(idx) {
   await connectWithProvider(_detectedWallets[idx]);
 }
 
+async function detectChainId() {
+  if (!_ethProvider) return null;
+  try {
+    const chainId = await _ethProvider.request({ method: 'eth_chainId' });
+    _currentChainId = chainId;
+    return chainId;
+  } catch(e) {
+    return null;
+  }
+}
+
+async function switchToEthereumMainnet() {
+  if (!_ethProvider) return false;
+  try {
+    await _ethProvider.request({
+      method: 'wallet_switchEthereumChain',
+      params: [{ chainId: MAINNET_CHAIN_ID }]
+    });
+  } catch(e) {
+    if (e && e.code === 4902) {
+      await _ethProvider.request({
+        method: 'wallet_addEthereumChain',
+        params: [ETHEREUM_MAINNET_PARAMS]
+      });
+    } else {
+      throw e;
+    }
+  }
+  const chainId = await detectChainId();
+  return chainId === MAINNET_CHAIN_ID;
+}
+
+async function ensureCorrectChain() {
+  if (!_ethProvider) { showStatus('err', 'connect metamask first'); return false; }
+  const chainId = await detectChainId();
+  if (chainId === MAINNET_CHAIN_ID) return true;
+  const name = ETH_CHAIN_NAMES[chainId] || ('chain ' + chainId);
+  showStatus('info', 'switching from <b>' + name + '</b> to Ethereum Mainnet...');
+  try {
+    const switched = await switchToEthereumMainnet();
+    if (switched) {
+      showStatus('info', 'switched to Ethereum Mainnet');
+      updateChainBadge();
+      validateForm();
+      return true;
+    }
+    showStatus('err', 'wallet did not switch to Ethereum Mainnet');
+    return false;
+  } catch(e) {
+    const msg = (e && e.message) || String(e);
+    showStatus('err', 'could not auto-switch: ' + msg + ' — please switch manually in your wallet');
+    return false;
+  }
+}
+
+function updateChainBadge() {
+  var el = $('eth-chain-badge');
+  if (!el) return;
+  if (!_currentChainId) {
+    el.textContent = '';
+    el.className = 'eth-chain-badge hidden';
+    return;
+  }
+  var name = ETH_CHAIN_NAMES[_currentChainId] || ('chain ' + _currentChainId);
+  if (_currentChainId === MAINNET_CHAIN_ID) {
+    el.textContent = 'Ethereum Mainnet';
+    el.className = 'eth-chain-badge ok';
+  } else {
+    el.textContent = 'WRONG: ' + name;
+    el.className = 'eth-chain-badge bad';
+  }
+}
+
 async function connectWithProvider(w) {
   _ethProvider = w.provider;
   try {
-    var accounts = await _ethProvider.request({ method: 'eth_requestAccounts' });
+    const accounts = await _ethProvider.request({ method: 'eth_requestAccounts' });
     if (!accounts.length) return;
     _ethAddr = accounts[0];
     $('eth-addr').textContent = _ethAddr.substring(0, 8) + '...' + _ethAddr.slice(-4);
@@ -339,6 +440,9 @@ async function connectWithProvider(w) {
     if (_dir === 'o2e') $('recipient').value = _ethAddr;
     else $('recipient').value = _octraAddr || '';
     try { localStorage.setItem('bridge_eth_wallet', w.name); } catch(e) {}
+    await detectChainId();
+    updateChainBadge();
+    if (_currentChainId !== MAINNET_CHAIN_ID) await ensureCorrectChain();
     await refreshBalances();
     validateForm();
     try { recoveryFetch(true); } catch(e) {}
@@ -350,6 +454,18 @@ async function connectWithProvider(w) {
         validateForm();
         try { recoveryFetch(true); } catch(e) {}
       }
+    });
+    _ethProvider.on('chainChanged', function(cid) {
+      _currentChainId = cid;
+      updateChainBadge();
+      if (cid === MAINNET_CHAIN_ID) {
+        showStatus('ok', 'switched to Ethereum Mainnet');
+      } else {
+        const name = ETH_CHAIN_NAMES[cid] || ('chain ' + cid);
+        showStatus('err', 'wrong network: <b>' + name + '</b>. click bridge to switch back to Ethereum Mainnet.');
+      }
+      refreshBalances();
+      validateForm();
     });
   } catch(e) { showStatus('err', w.name + ': ' + e.message); }
 }
@@ -396,21 +512,23 @@ function setDir(d) {
 }
 
 function validateForm() {
-  var btn = $('bridge-btn');
-  var amtStr = $('bridge-amount').value.trim();
-  var recip = $('recipient').value.trim();
-  var amt = parseFloat(amtStr);
+  const btn = $('bridge-btn');
+  const amtStr = $('bridge-amount').value.trim();
+  const recip = $('recipient').value.trim();
+  const amt = parseFloat(amtStr);
   $('output-val').textContent = (amtStr && !isNaN(amt) && amt > 0) ? addCommas(amtStr) : '0';
   if (!_octraAddr || !_ethAddr) { btn.disabled = true; btn.textContent = 'connect both wallets'; return; }
   if (!amtStr || isNaN(amt) || amt <= 0) { btn.disabled = true; btn.textContent = 'enter amount'; return; }
-  var rawAmt = parseU(amtStr, OCT_DECIMALS);
+  const rawAmt = parseU(amtStr, OCT_DECIMALS);
   if (_dir === 'o2e') {
     if (BigInt(rawAmt) > BigInt(_octBalance)) { btn.disabled = true; btn.textContent = 'insufficient OCT'; return; }
     if (!recip || !/^0x[0-9a-fA-F]{40}$/.test(recip)) { btn.disabled = true; btn.textContent = 'enter valid ETH address'; return; }
+    if (_currentChainId && _currentChainId !== MAINNET_CHAIN_ID) { btn.disabled = false; btn.textContent = 'switch to ethereum mainnet'; return; }
     btn.disabled = false; btn.textContent = 'bridge ' + amtStr + ' OCT';
   } else {
     if (BigInt(rawAmt) > BigInt(_woctBalance)) { btn.disabled = true; btn.textContent = 'insufficient wOCT'; return; }
     if (!recip || recip.length !== 47 || recip.substring(0, 3) !== 'oct') { btn.disabled = true; btn.textContent = 'enter valid octra address'; return; }
+    if (_currentChainId && _currentChainId !== MAINNET_CHAIN_ID) { btn.disabled = false; btn.textContent = 'switch to ethereum mainnet'; return; }
     btn.disabled = false; btn.textContent = 'bridge ' + amtStr + ' wOCT';
   }
 }
@@ -421,9 +539,10 @@ function setMax() {
   validateForm();
 }
 
-function doBridge() {
-  var amt = $('bridge-amount').value.trim();
-  var recip = $('recipient').value.trim();
+async function doBridge() {
+  if (!await ensureCorrectChain()) return;
+  const amt = $('bridge-amount').value.trim();
+  const recip = $('recipient').value.trim();
   if (_dir === 'o2e') {
     $('cm-title').textContent = 'confirm: lock OCT';
     $('cm-action').textContent = 'lock OCT -> mint wOCT';
@@ -459,6 +578,8 @@ var _pendingClaim = null;
 var _activeHistoryId = null;
 
 async function doForward() {
+  if (!_ethProvider || !_ethAddr) { showStatus('err', 'connect metamask first'); return; }
+  if (!await ensureCorrectChain()) return;
   var amt = $('bridge-amount').value.trim();
   var recip = $('recipient').value.trim();
   var rawAmt = parseU(amt, OCT_DECIMALS);
@@ -603,6 +724,7 @@ async function getSafeGas() {
 
 async function doClaim() {
   if (!_pendingClaim) return;
+  if (!await ensureCorrectChain()) return;
   var claimBtn = $('claim-btn');
   if (claimBtn) { claimBtn.disabled = true; claimBtn.textContent = 'submitting...'; }
   var explorerBase = (typeof ETH_EXPLORER !== 'undefined' && ETH_EXPLORER) ? ETH_EXPLORER : 'https://etherscan.io';
@@ -920,6 +1042,7 @@ async function historyClaim(id) {
   if (!entry) return;
   if (!entry.claim_data) { showStatus('err', 'no claim data cached, click refresh status'); return; }
   if (!_ethProvider || !_ethAddr) { showStatus('err', 'connect metamask first'); return; }
+  if (!await ensureCorrectChain()) return;
   historyUpdate(id, {status:'claiming'});
   showStatus('info', 'submitting claim: ' + entry.amt_display + ' wOCT ep ' + entry.epoch);
   try {
@@ -1136,6 +1259,8 @@ async function buildClaimCalldata(epochId, recipient, rawAmt, headerData) {
 }
 
 async function doReverse() {
+  if (!_ethProvider || !_ethAddr) { showStatus('err', 'connect metamask first'); return; }
+  if (!await ensureCorrectChain()) return;
   var amt = $('bridge-amount').value.trim();
   var recip = $('recipient').value.trim();
   var rawAmt = parseU(amt, OCT_DECIMALS);

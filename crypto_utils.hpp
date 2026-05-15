@@ -267,10 +267,6 @@ inline void ed25519_pk_to_curve25519(const uint8_t ed_sk[64], uint8_t x_pk[32]) 
     crypto_scalarmult_base(x_pk, x_sk);
 }
 
-
-
-// dont touch 
-
 inline bool ed25519_pub_to_x25519(const uint8_t ed_pub[32], uint8_t x_pub[32]) {
     BN_CTX* ctx = BN_CTX_new();
     BIGNUM *p = BN_new(), *y = BN_new(), *one = BN_new();
@@ -316,9 +312,6 @@ done:
     BN_CTX_free(ctx);
     return ok;
 }
-
-
-// !!
 
 inline void secure_zero(void* ptr, size_t len) {
     volatile uint8_t* p = static_cast<volatile uint8_t*>(ptr);
