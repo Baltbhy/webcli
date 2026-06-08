@@ -3,15 +3,15 @@ contract Escrow {
     seller: address
     buyer: address
     arbiter: address
-    amount: int
+    amount: u128
     funded: bool
     released: bool
   }
 
   event Created(seller: address, buyer: address, arbiter: address)
-  event Funded(amount: int)
-  event Released(to: address, amount: int)
-  event Refunded(to: address, amount: int)
+  event Funded(amount: u128)
+  event Released(to: address, amount: u128)
+  event Refunded(to: address, amount: u128)
 
   constructor(s: address, b: address, a: address) {
     assert_address(s)

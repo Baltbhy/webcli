@@ -94,7 +94,8 @@ public:
             httplib::SSLClient cli(host_, port_);
             cli.set_connection_timeout(timeout_sec, 0);
             cli.set_read_timeout(timeout_sec, 0);
-            cli.enable_server_certificate_verification(false);
+            if (cli.ssl_context()) SSL_CTX_set_default_verify_paths(cli.ssl_context());
+            cli.enable_server_certificate_verification(true);
             auto res = cli.Post(path_, hdrs, body, "application/json");
             if (!res) return {false, {}, "connection failed"};
             return parse_response(res->body);
@@ -220,7 +221,7 @@ public:
                           const nlohmann::json& params,
                           const std::string& caller,
                           bool include_storage = false) {
-        return call("octra_circleView", {circle_id, method, params, caller, include_storage}, 15);
+        return call("octra_circleView", {circle_id, method, params, caller, include_storage}, 600);
     }
 
     RpcResult circle_view_auth(const std::string& circle_id,
@@ -230,7 +231,7 @@ public:
                                const std::string& pub_b64,
                                const std::string& sig_b64,
                                bool include_storage = false) {
-        return call("octra_circleViewAuth", {circle_id, method, params, addr, pub_b64, sig_b64, include_storage}, 15);
+        return call("octra_circleViewAuth", {circle_id, method, params, addr, pub_b64, sig_b64, include_storage}, 600);
     }
 
     RpcResult circle_slot_policy(const std::string& circle_id, const std::string& slot_ref) {
@@ -590,8 +591,9 @@ public:
         return call("octra_tokensByAddress", {addr}, 15);
     }
 
-    RpcResult contract_storage(const std::string& addr, const std::string& key) {
-        return call("octra_contractStorage", {addr, key});
+    RpcResult contract_storage(const std::string& addr, const std::string& key, const std::string& limit = "") {
+        if (limit.empty()) return call("octra_contractStorage", {addr, key});
+        return call("octra_contractStorage", {addr, key, limit});
     }
 
     RpcResult contract_abi(const std::string& addr) {
@@ -632,7 +634,8 @@ public:
             httplib::SSLClient cli(host_, port_);
             cli.set_connection_timeout(timeout_sec, 0);
             cli.set_read_timeout(timeout_sec, 0);
-            cli.enable_server_certificate_verification(false);
+            if (cli.ssl_context()) SSL_CTX_set_default_verify_paths(cli.ssl_context());
+            cli.enable_server_certificate_verification(true);
             auto r = cli.Post(path_, hdrs, body, "application/json");
             if (!r) { for (auto& o : out) o.error = "connection failed"; return out; }
             resp_body = r->body;

@@ -19,6 +19,7 @@ static constexpr uint8_t TAG_SECKEY = 2;
 static constexpr uint8_t TAG_RANGE_PROOF = 4;
 static constexpr uint8_t TAG_AGG_RANGE_PROOF = 5;
 static constexpr uint8_t TAG_ZERO_PROOF = 6;
+static constexpr uint64_t MAX_BITVEC_BITS = 1ULL << 20;
 
 struct Writer {
     std::vector<uint8_t> buf;
@@ -152,12 +153,20 @@ struct Reader {
     pvac::Scalar scalar() {
         uint8_t b[32];
         raw(b, 32);
-        return pvac::sc_from_bytes(b);
+        pvac::Scalar scalar = pvac::sc_from_bytes(b);
+        if (!failed && !pvac::sc_is_canonical(scalar))
+            fail("pvac_ser: non-canonical scalar encoding");
+        return failed ? pvac::sc_zero() : scalar;
     }
 
     pvac::RistrettoPoint rist_point() {
         pvac::RistrettoPoint pt;
         raw(pt.data(), 32);
+        if (!failed) {
+            pvac::ExtPoint decoded;
+            if (!pvac::rist_decode(decoded, pt))
+                fail("pvac_ser: invalid Ristretto point encoding");
+        }
         return pt;
     }
 
@@ -165,6 +174,8 @@ struct Reader {
         pvac::BitVec bv;
         bv.nbits = u64();
         size_t nw = u64();
+        if (!failed && bv.nbits > MAX_BITVEC_BITS)
+            fail("pvac_ser: bitvec too large");
         check_count(nw, 8);
         size_t expected_nw = static_cast<size_t>((bv.nbits + 63) / 64);
         if (!failed && nw != expected_nw)
@@ -209,8 +220,11 @@ inline void validate_cipher_structure(const pvac::Cipher& cipher) {
         const auto& layer = cipher.L[layer_id];
         if (layer.rule != pvac::RRule::BASE && layer.rule != pvac::RRule::PROD)
             throw std::runtime_error("pvac_ser: invalid layer rule");
-        if (layer.rule == pvac::RRule::PROD && (layer.pa >= cipher.L.size() || layer.pb >= cipher.L.size()))
+        if (layer.rule == pvac::RRule::PROD &&
+            (layer.pa >= layer_id || layer.pb >= layer_id))
             throw std::runtime_error("pvac_ser: invalid product parent");
+        if (layer.rule == pvac::RRule::PROD && !layer.PC.empty())
+            throw std::runtime_error("pvac_ser: product layer must not contain PC");
         if (!layer.PC.empty() && layer.PC.size() != cipher.slots)
             throw std::runtime_error("pvac_ser: layer PC/slots size mismatch");
     }
@@ -320,7 +334,7 @@ inline pvac::Layer read_layer(Reader& r, uint8_t ver = VERSION_V2) {
         if (r.failed) return L;
         L.PC.resize(nPC);
         for (size_t i = 0; i < nPC; i++)
-            r.raw(L.PC[i].data(), 32);
+            L.PC[i] = r.rist_point();
     }
 
     return L;
@@ -350,6 +364,11 @@ inline pvac::Edge read_edge(Reader& r) {
 }
 
 inline std::vector<uint8_t> serialize_cipher(const pvac::Cipher& C) {
+    // ! check as well (next week)
+      validate_cipher_structure(C);
+
+
+
     Writer w;
     w.header(TAG_CIPHER);
     w.u64(C.slots);

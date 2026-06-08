@@ -25,6 +25,21 @@
               2025-2026 Julia L.
 */
 
+function validatePin(pin) {
+  if (!pin || pin.length === 0) return 'PIN required';
+  if (pin.length < 8) return 'PIN must be at least 8 characters';
+  if (pin.length > 64) return 'PIN too long (max 64 characters)';
+  if (pin.length < 15) {
+    var hasLetter = /[A-Za-z]/.test(pin);
+    var hasDigit = /[0-9]/.test(pin);
+    var hasSymbol = /[^A-Za-z0-9]/.test(pin);
+    if (!hasLetter || !hasDigit || !hasSymbol) {
+      return 'under 15 chars: must include a letter, a digit and a special symbol';
+    }
+  }
+  return '';
+}
+
 function idePrompt(title, message, defaultVal) {
   return new Promise(function(resolve) {
     var ov = document.createElement('div');
@@ -114,6 +129,8 @@ var _tokenDecimals = {};
 var _tokensLoaded = false;
 var _tokTxGen = 0;
 var _compiledAbi = null;
+var _compiledVerification = null;
+var _compiledCertificate = null;
 var _fees = {};
 var _rpcHost = '';
 var _hasMasterSeed = false;
@@ -1025,6 +1042,9 @@ async function doCompileProject() {
   clearResult('ct-compile-result');
   editorClearError();
   _compiledAbi = null;
+  _compiledVerification = null;
+  _compiledCertificate = null;
+  renderVerificationReport(null);
   var abiDiv = $('ct-abi-display');
   if (abiDiv) abiDiv.style.display = 'none';
 
@@ -1053,6 +1073,14 @@ async function doCompileProject() {
     if (res.disasm) {
       var disEl = $('ct-disasm-code');
       if (disEl) disEl.innerHTML = highlightDisasm(res.disasm);
+    }
+    if (res.verification) {
+      _compiledVerification = res.verification;
+      _compiledCertificate = res.certificate || null;
+      renderVerificationReport(res.verification, _compiledCertificate);
+      msg += ' | ' + verificationLabel(res.verification);
+      showResult('ct-compile-result', verificationLevel(res.verification) !== 'error', msg + (verificationLevel(res.verification) === 'error' ? ' (deploy not blocked yet)' : ''));
+      logVerificationTrace(res.verification);
     }
     showBottomPanels();
     consoleLog('info', msg);
@@ -1086,16 +1114,17 @@ async function doVerifyProject() {
     var payload = { address: addr, source: mainSource };
     if (depFiles.length > 0) payload.files = depFiles;
     var res = await api('POST', '/contract/verify', payload);
+    var safety = res.verification ? '<br>' + verificationResultHtml(res.verification) : '';
     showResult('ct-verify-result', true,
-      'source verified - code_hash: <span class="mono">' + escapeHtml(res.code_hash || '') + '</span>');
+      'source verified - code_hash: <span class="mono">' + escapeHtml(res.code_hash || '') + '</span>' + safety);
   } catch (e) {
     showResult('ct-verify-result', false, e.message);
   }
 }
 
 function networkLabel(host) {
-  if (host === '46.101.86.250') return 'main net';
-  if (host === '165.227.225.79') return 'dev net';
+  if (host === 'octra.network') return 'main net';
+  if (host === 'devnet.octrascan.io' || host === '165.227.225.79') return 'dev net';
   if (host === 'localhost' || host === '127.0.0.1') return 'local';
   return host;
 }
@@ -1901,7 +1930,7 @@ function escapeHtmlCode(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-var _amlRe = /(\/\*[\s\S]*?\*\/)|(\/\/[^\n]*)|("(?:[^"\\]|\\.)*")|(\b(?:contract|state|constructor|fn|view|let|if|else|while|for|in|return|assert|require|match|const|struct|enum|true|false|payable|nonreentrant|public|private|internal|event|error|import|interface|implements|indexed)\b)|(\b(?:string|int|bool|address|bytes|cipher|pubkey|map|list|void)\b)|(\b(?:self_addr|transfer|call|to_int|checkpoint|rollback|commit|origin|caller|balance|emit|log|value|epoch|min|max|abs|concat|to_string|len|split|join|replace|pow|sha256|keccak256|is_address|assert_address|starts_with|substr|index_of|bit_and|bit_or|bit_xor|parse_ints|mget|mset|blob_store|blob_load|some|none|is_some_opt|unwrap|fhe_load_pk|fhe_add|fhe_sub|fhe_scale|fhe_add_const|fhe_sub_const|fhe_verify_zero|fhe_verify_range|fhe_verify_bound|fhe_commit|fhe_pedersen|fhe_ser|fhe_deser)\b)|(\bself\b)|(\b[0-9]+\b)|([+\-*\/]=|[=!<>]=|&&|\|\||->|\?|[+\-*\/%<>=!])/g;
+var _amlRe = /(\/\*[\s\S]*?\*\/)|(\/\/[^\n]*)|("(?:[^"\\]|\\.)*")|(\b(?:contract|state|constructor|fn|view|let|if|else|while|for|in|return|assert|require|match|const|struct|enum|true|false|payable|nonreentrant|public|private|internal|event|error|import|interface|implements|indexed)\b)|(\b(?:string|int|u64|u128|u256|bool|address|bytes|cipher|pubkey|map|list|void)\b)|(\b(?:self_addr|transfer|call|to_int|checkpoint|rollback|commit|origin|caller|balance|emit|log|value|epoch|min|max|abs|concat|to_string|len|split|join|replace|pow|sha256|keccak256|is_address|assert_address|starts_with|substr|index_of|bit_and|bit_or|bit_xor|parse_ints|mget|mset|blob_store|blob_load|some|none|is_some_opt|unwrap|fhe_load_pk|fhe_add|fhe_sub|fhe_mul|fhe_scale|fhe_add_const|fhe_sub_const|fhe_verify_zero|fhe_verify_range|fhe_verify_bound|fhe_commit|fhe_pedersen|fhe_ser|fhe_deser)\b)|(\bself\b)|(\b[0-9]+\b)|([+\-*\/]=|[=!<>]=|&&|\|\||->|\?|[+\-*\/%<>=!])/g;
 
 function highlightAml(src) {
   _amlRe.lastIndex = 0;
@@ -2034,6 +2063,9 @@ async function doCompile() {
   clearResult('ct-compile-result');
   editorClearError();
   _compiledAbi = null;
+  _compiledVerification = null;
+  _compiledCertificate = null;
+  renderVerificationReport(null);
   var source = $('ct-source').value;
   var lang = $('ct-lang').value;
   if (!source.trim()) { showResult('ct-compile-result', false, 'source required'); return; }
@@ -2053,6 +2085,14 @@ async function doCompile() {
     if (res.disasm) {
       var disEl = $('ct-disasm-code');
       if (disEl) disEl.innerHTML = highlightDisasm(res.disasm);
+    }
+    if (res.verification) {
+      _compiledVerification = res.verification;
+      _compiledCertificate = res.certificate || null;
+      renderVerificationReport(res.verification, _compiledCertificate);
+      msg += ' | ' + verificationLabel(res.verification);
+      showResult('ct-compile-result', verificationLevel(res.verification) !== 'error', msg + (verificationLevel(res.verification) === 'error' ? ' (deploy not blocked yet)' : ''));
+      logVerificationTrace(res.verification);
     }
     showBottomPanels();
     consoleLog('info', msg);
@@ -2100,6 +2140,87 @@ function consoleLog(level, msg) {
 function consoleClear() {
   _consoleLogs = [];
   renderConsole();
+}
+
+function verificationLevel(v) {
+  if (!v) return 'unknown';
+  if (v.safety) return String(v.safety);
+  if (v.verified === false || (v.errors || 0) > 0) return 'error';
+  if ((v.warnings || 0) > 0) return 'warning';
+  return 'safe';
+}
+
+function verificationLabel(v) {
+  var level = verificationLevel(v);
+  if (level === 'safe') return 'formal verification = safe';
+  if (level === 'warning') return 'formal verification = warning';
+  if (level === 'error') return 'formal verification = error';
+  return 'formal verification = unavailable';
+}
+
+function verificationResultHtml(v) {
+  if (!v) return '';
+  var level = verificationLevel(v);
+  var ok = level !== 'error';
+  return '<span class="' + (ok ? 'ok' : 'bad') + '">' + escapeHtml(verificationLabel(v)) +
+    '</span> <span class="mono">errors = ' + escapeHtml(String(v.errors || 0)) +
+    ' warnings = ' + escapeHtml(String(v.warnings || 0)) + '</span>';
+}
+
+function renderVerificationReport(v, cert) {
+  var el = $('ct-verify-output');
+  if (!el) return;
+  if (!v) {
+    el.innerHTML = '<div class="panel-empty">compile AppliedML to view formal verification trace</div>';
+    return;
+  }
+  var h = '';
+  h += '<div class="console-line info">schema = ' + escapeHtml(v.schema || '-') + '</div>';
+  h += '<div class="console-line info">engine = ' + escapeHtml(v.engine || '-') + '</div>';
+  h += '<div class="console-line info">proof_model = ' + escapeHtml(v.proof_model || '-') + '</div>';
+  if (cert) {
+    h += '<div class="console-line info">certificate = ' + escapeHtml(cert.schema || '-') + '</div>';
+    h += '<div class="console-line info">source_hash = ' + escapeHtml(cert.source_hash || '-') + '</div>';
+    h += '<div class="console-line info">bytecode_hash = ' + escapeHtml(cert.bytecode_hash || '-') + '</div>';
+    h += '<div class="console-line info">verification_hash = ' + escapeHtml(cert.verification_hash || '-') + '</div>';
+  }
+  h += '<div class="console-line ' + (verificationLevel(v) === 'error' ? 'error' : 'info') + '">safety = ' + escapeHtml(verificationLevel(v)) + ' | errors = ' + escapeHtml(String(v.errors || 0)) + ' | warnings = ' + escapeHtml(String(v.warnings || 0)) + '</div>';
+  var trace = Array.isArray(v.trace) ? v.trace : [];
+  for (var i = 0; i < trace.length; i++) {
+    var t = trace[i] || {};
+    var level = t.status === 'error' ? 'error' : (t.status === 'warning' ? 'warn' : 'info');
+    h += '<div class="console-line ' + level + '">trace = ' + escapeHtml(t.code || '-') + ' | status = ' + escapeHtml(t.status || '-') + ' | findings = ' + escapeHtml(String(t.findings || 0)) + '</div>';
+  }
+  var invariants = Array.isArray(v.invariants) ? v.invariants : [];
+  for (var k = 0; k < invariants.length; k++) {
+    var inv = invariants[k] || {};
+    var invLevel = inv.status === 'warning' ? 'warn' : (inv.status === 'error' ? 'error' : 'info');
+    h += '<div class="console-line ' + invLevel + '">invariant = ' + escapeHtml(inv.code || '-') + ' | status = ' + escapeHtml(inv.status || '-') + ' | fields = ' + escapeHtml((inv.fields || []).join(',')) + ' | functions = ' + escapeHtml((inv.functions || []).join(',')) + '</div>';
+  }
+  var summaries = Array.isArray(v.function_summaries) ? v.function_summaries : [];
+  for (var s = 0; s < summaries.length; s++) {
+    var sm = summaries[s] || {};
+    h += '<div class="console-line info">summary = ' + escapeHtml(sm.name || '-') + ' | visibility = ' + escapeHtml(sm.visibility || '-') + ' | writes = ' + escapeHtml((sm.direct_writes || []).join(',')) + ' | transitive_writes = ' + escapeHtml((sm.transitive_writes || []).join(',')) + '</div>';
+  }
+  var findings = Array.isArray(v.findings) ? v.findings : [];
+  for (var j = 0; j < findings.length; j++) {
+    var f = findings[j] || {};
+    var sev = f.severity === 'error' ? 'error' : 'warn';
+    h += '<div class="console-line ' + sev + '">finding = ' + escapeHtml(f.code || '-') + ' | fn = ' + escapeHtml(f.function_name || '-') + ' | field = ' + escapeHtml(f.state_field || '-') + ' | param = ' + escapeHtml(f.parameter || '-') + ' | message = ' + escapeHtml(f.message || '-') + '</div>';
+  }
+  el.innerHTML = h;
+}
+
+function logVerificationTrace(v) {
+  if (!v) return;
+  consoleLog(verificationLevel(v) === 'error' ? 'error' : 'info',
+    verificationLabel(v) + ' | errors = ' + (v.errors || 0) + ' | warnings = ' + (v.warnings || 0));
+  var trace = Array.isArray(v.trace) ? v.trace : [];
+  for (var i = 0; i < trace.length; i++) {
+    var t = trace[i] || {};
+    consoleLog(t.status === 'error' ? 'error' : (t.status === 'warning' ? 'warn' : 'info'),
+      'trace = ' + (t.code || '-') + ' | status = ' + (t.status || '-') + ' | findings = ' + (t.findings || 0));
+  }
 }
 
 function renderConsole() {
@@ -2216,9 +2337,10 @@ function verifySourceRetry(addr, source, depFiles, attempts) {
     try {
       var payload = { address: addr, source: source };
       if (depFiles && depFiles.length > 0) payload.files = depFiles;
-      await api('POST', '/contract/verify', payload);
+      var res = await api('POST', '/contract/verify', payload);
+      var safety = res.verification ? ' - ' + verificationResultHtml(res.verification) : '';
       showResult('ct-deploy-result', true,
-        'deployed to <span class="mono">' + escapeHtml(addr) + '</span> - <strong>source verified</strong>');
+        'deployed to <span class="mono">' + escapeHtml(addr) + '</span> - <strong>source verified</strong>' + safety);
     } catch (e) {
       verifySourceRetry(addr, source, depFiles, attempts - 1);
     }
@@ -2445,8 +2567,9 @@ async function doVerifyContract() {
   if (!source.trim()) { showResult('ct-verify-result', false, 'source required'); return; }
   try {
     var res = await api('POST', '/contract/verify', { address: addr, source: source });
+    var safety = res.verification ? '<br>' + verificationResultHtml(res.verification) : '';
     showResult('ct-verify-result', true,
-      'source verified - code_hash: <span class="mono">' + escapeHtml(res.code_hash || '') + '</span>');
+      'source verified - code_hash: <span class="mono">' + escapeHtml(res.code_hash || '') + '</span>' + safety);
   } catch (e) {
     showResult('ct-verify-result', false, e.message);
   }
@@ -2766,8 +2889,8 @@ async function showKeys() {
 }
 
 async function revealPrivateKeys() {
-  var pin = await modalPrompt('reveal private keys', 'enter 6-digit PIN', { pin: true, btnText: 'reveal' });
-  if (!pin || !/^\d{6}$/.test(pin)) return;
+  var pin = await modalPrompt('reveal private keys', 'enter PIN', { pin: true, btnText: 'reveal' });
+  if (!pin) return;
   try {
     var res = await api('POST', '/keys/private', {
       pin: pin,
@@ -2814,9 +2937,13 @@ async function loadAccountList() {
       el.innerHTML = '<div class="staging-empty">no accounts</div>';
       return;
     }
-    var btnStyle = 'display:inline-block;width:80px;padding:8px;margin:0;background:#E5E9EF;border:none;border-top:1px solid #D0D7E2;border-bottom:1px solid #D0D7E2;margin-right:4px;color:#3B567F;font-family:Tahoma,arial,sans-serif;font-size:11px;font-weight:bold;letter-spacing:1px;cursor:pointer;text-align:center;text-transform:lowercase';
+    var btnStyle = 'display:inline-block;width:96px;padding:8px;margin:0;background:#E5E9EF;border:none;border-top:1px solid #D0D7E2;border-bottom:1px solid #D0D7E2;margin-right:4px;color:#3B567F;font-family:Tahoma,arial,sans-serif;font-size:11px;font-weight:bold;letter-spacing:1px;cursor:pointer;text-align:center;text-transform:lowercase';
     var btnHover = 'onmouseenter="this.style.background=\'#D0D7E2\'" onmouseleave="this.style.background=\'#E5E9EF\'"';
-    var html = '<table class="tx-table" style="width:100%"><tbody>';
+    var html = '<table class="tx-table" style="width:100%;table-layout:fixed"><colgroup>';
+    html += '<col style="width:22%">';
+    html += '<col style="width:auto">';
+    html += '<col style="width:220px">';
+    html += '</colgroup><tbody>';
     for (var i = 0; i < accounts.length; i++) {
       var a = accounts[i];
       var badge = a.active ? '<span style="color:#4CAF50;margin-right:4px">●</span>' : '';
@@ -2832,11 +2959,13 @@ async function loadAccountList() {
       var name = a.name || 'unnamed';
       var escapedName = name.replace(/'/g, "\\'");
       html += '<tr>';
-      html += '<td style="padding:6px 8px;vertical-align:middle">' + badge + '<b>' + name + '</b>' + hdLabel + '</td>';
+      html += '<td style="padding:6px 8px;vertical-align:middle;overflow:hidden;text-overflow:ellipsis">' + badge + '<b>' + name + '</b>' + hdLabel + '</td>';
       html += '<td class="mono" style="padding:6px 8px;font-size:11px;vertical-align:middle;word-break:break-all">' + a.addr + '</td>';
       html += '<td style="padding:6px 4px;text-align:right;white-space:nowrap;vertical-align:middle">';
       if (!a.active) {
         html += '<button style="' + btnStyle + '" ' + btnHover + ' onclick="doSwitchAccount(\'' + a.addr + '\')">switch</button>';
+      } else {
+        html += '<button style="' + btnStyle + '" ' + btnHover + ' onclick="doChangePinForWallet(\'' + a.addr + '\')">change PIN</button>';
       }
       html += '<button style="' + btnStyle + '" ' + btnHover + ' onclick="doRenameAccount(\'' + a.addr + '\',\'' + escapedName + '\')">rename</button>';
       html += '</td></tr>';
@@ -2873,6 +3002,8 @@ function modalPrompt(title, label, opts) {
     $('modal-result').innerHTML = '';
     if (opts.pin) {
       $('modal-pin').style.display = 'block';
+      var lbl = $('modal-pin-label');
+      if (lbl) lbl.textContent = label;
       $('modal-pin-input').value = '';
       $('pin-back-btn').style.display = '';
       var unlockBtn = $('modal-pin').querySelector('.action-btn');
@@ -2913,8 +3044,8 @@ function modalPrompt(title, label, opts) {
 }
 
 async function doSwitchAccount(addr) {
-  var pin = await modalPrompt('switch account', 'enter 6-digit PIN', { pin: true, btnText: 'switch' });
-  if (!pin || !/^\d{6}$/.test(pin)) return;
+  var pin = await modalPrompt('switch account', 'enter PIN', { pin: true, btnText: 'switch' });
+  if (!pin) return;
   clearResult('wallet-mgmt-result');
   try {
     await api('POST', '/wallet/switch', { addr: addr, pin: pin });
@@ -2940,6 +3071,26 @@ async function doSwitchAccount(addr) {
   }
 }
 
+async function doChangePinForWallet(addr) {
+  var cur = await modalPrompt('change PIN (step 1 of 3)', 'enter current PIN', { pin: true, btnText: 'next' });
+  if (!cur) return;
+  var np = await modalPrompt('change PIN (step 2 of 3)', 'enter new PIN (min 8, 15+ recommended)', { pin: true, btnText: 'next' });
+  if (!np) return;
+  var newErr = validatePin(np);
+  if (newErr) { showResult('wallet-mgmt-result', false, 'new PIN: ' + newErr); return; }
+  var nc = await modalPrompt('change PIN (step 3 of 3)', 'confirm new PIN', { pin: true, btnText: 'change' });
+  if (!nc) return;
+  if (np !== nc) { showResult('wallet-mgmt-result', false, 'PINs do not match'); return; }
+  if (cur === np) { showResult('wallet-mgmt-result', false, 'new PIN must be different from current'); return; }
+  clearResult('wallet-mgmt-result');
+  try {
+    await api('POST', '/wallet/change-pin', { current_pin: cur, new_pin: np });
+    showResult('wallet-mgmt-result', true, 'PIN changed successfully');
+  } catch (e) {
+    showResult('wallet-mgmt-result', false, e.message);
+  }
+}
+
 async function doRenameAccount(addr, currentName) {
   var name = await modalPrompt('rename account', 'new name', { placeholder: currentName || 'my wallet' });
   if (!name || !name.trim()) return;
@@ -2955,8 +3106,8 @@ async function doRenameAccount(addr, currentName) {
 
 async function doDeriveAccount() {
   if (!_hasMasterSeed) return;
-  var pin = await modalPrompt('derive new address', 'enter 6-digit PIN', { pin: true });
-  if (!pin || !/^\d{6}$/.test(pin)) return;
+  var pin = await modalPrompt('derive new address', 'enter PIN', { pin: true });
+  if (!pin) return;
   var name = await modalPrompt('derive new address', 'name for new account (optional)', { placeholder: 'trading' });
   if (name === null) return;
   clearResult('wallet-mgmt-result');
@@ -3022,8 +3173,9 @@ async function doChangePin() {
   var cur = $('pin-current').value;
   var np = $('pin-new').value;
   var nc = $('pin-confirm-new').value;
-  if (!/^\d{6}$/.test(cur)) { showResult('pin-change-result', false, 'current PIN must be 6 digits'); return; }
-  if (!/^\d{6}$/.test(np)) { showResult('pin-change-result', false, 'new PIN must be 6 digits'); return; }
+  if (!cur || cur.length === 0) { showResult('pin-change-result', false, 'current PIN required'); return; }
+  var newErr = validatePin(np);
+  if (newErr) { showResult('pin-change-result', false, 'new PIN: ' + newErr); return; }
   if (np !== nc) { showResult('pin-change-result', false, 'PINs do not match'); return; }
   if (cur === np) { showResult('pin-change-result', false, 'new PIN must be different'); return; }
   try {
@@ -3049,6 +3201,8 @@ function hideAllModalPanels() {
   $('modal-pin-setup').style.display = 'none';
   $('modal-mnemonic-show').style.display = 'none';
   $('modal-result').innerHTML = '';
+  var lbl = $('modal-pin-label');
+  if (lbl) lbl.textContent = 'enter PIN to unlock';
 }
 
 function showPinEntry(showBack) {
@@ -3124,7 +3278,7 @@ function modalBackFromPin() {
 
 function modalCreate() {
   showPinSetup('create');
-  $('modal-sub').textContent = 'set a 6-digit PIN for your new wallet';
+  $('modal-sub').textContent = 'set a PIN for your new wallet';
 }
 
 function modalDoImport() {
@@ -3153,7 +3307,7 @@ function modalDoImport() {
     $('modal-privkey').value = '';
   }
   showPinSetup('import');
-  $('modal-sub').textContent = 'set a 6-digit PIN for your wallet';
+  $('modal-sub').textContent = 'set a PIN for your wallet';
 }
 
 function showMnemonicWords(mnemonic) {
@@ -3179,8 +3333,8 @@ function modalMnemonicDone() {
 
 async function modalUnlock() {
   var pin = $('modal-pin-input').value;
-  if (!/^\d{6}$/.test(pin)) {
-    $('modal-result').innerHTML = '<div class="result-msg result-error">PIN must be exactly 6 digits</div>';
+  if (!pin || pin.length === 0) {
+    $('modal-result').innerHTML = '<div class="result-msg result-error">PIN required</div>';
     return;
   }
   if (_modalPromptResolve) {
@@ -3214,8 +3368,9 @@ async function modalUnlock() {
 async function modalFinishSetup() {
   var pin = $('modal-pin-new').value;
   var confirm = $('modal-pin-confirm').value;
-  if (!/^\d{6}$/.test(pin)) {
-    $('modal-result').innerHTML = '<div class="result-msg result-error">PIN must be exactly 6 digits</div>';
+  var pinErr = validatePin(pin);
+  if (pinErr) {
+    $('modal-result').innerHTML = '<div class="result-msg result-error">' + pinErr + '</div>';
     return;
   }
   if (pin !== confirm) {

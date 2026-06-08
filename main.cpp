@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cctype>
 #include <string>
 #include <vector>
 #include <set>
@@ -160,6 +161,11 @@ static void pk_cache_put(const std::string& addr, const std::vector<uint8_t>& pk
     g_pk_cache[addr] = pk;
 }
 
+static void pk_cache_erase(const std::string& addr) {
+    std::lock_guard<std::mutex> lk(g_pk_mtx);
+    g_pk_cache.erase(addr);
+}
+
 static void handle_signal(int) {
     octra::secure_zero(g_wallet.sk, 64);
     octra::secure_zero(g_wallet.pk, 32);
@@ -178,6 +184,88 @@ static double now_ts() {
 
 static json err_json(const std::string& msg) {
     return {{"error", msg}};
+}
+
+static std::string lower_ascii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+static bool starts_with(const std::string& s, const std::string& prefix) {
+    return s.rfind(prefix, 0) == 0;
+}
+
+static bool is_loopback_host(std::string host, int port) {
+    host = lower_ascii(host);
+    std::string suffix = ":" + std::to_string(port);
+    if (host.size() > suffix.size() &&
+        host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        host.resize(host.size() - suffix.size());
+    }
+    return host == "127.0.0.1" || host == "localhost" || host == "[::1]";
+}
+
+static bool is_allowed_webcli_origin(const std::string& origin, int port) {
+    std::string o = lower_ascii(origin);
+    std::string suffix = ":" + std::to_string(port);
+    return o == "http://127.0.0.1" + suffix ||
+           o == "http://localhost" + suffix ||
+           o == "http://[::1]" + suffix;
+}
+
+static bool webcli_request_allowed(const httplib::Request& req, int port, std::string& reason) {
+    if (!starts_with(req.path, "/api/")) return true;
+
+    std::string host = req.get_header_value("Host");
+    if (!host.empty() && !is_loopback_host(host, port)) {
+        reason = "non-loopback host";
+        return false;
+    }
+
+    std::string fetch_site = lower_ascii(req.get_header_value("Sec-Fetch-Site"));
+    if (!fetch_site.empty() && fetch_site != "same-origin" && fetch_site != "none") {
+        reason = "cross-site fetch";
+        return false;
+    }
+
+    std::string origin = req.get_header_value("Origin");
+    if (!origin.empty() && !is_allowed_webcli_origin(origin, port)) {
+        reason = "cross-origin request";
+        return false;
+    }
+
+    bool same_origin_fetch = !fetch_site.empty() && (fetch_site == "same-origin" || fetch_site == "none");
+    bool same_origin_header = !origin.empty() && is_allowed_webcli_origin(origin, port);
+    bool state_changing = req.method == "POST" || req.method == "PUT" || req.method == "DELETE";
+    if (state_changing && !same_origin_fetch && !same_origin_header) {
+        reason = "unverified origin on state-changing request";
+        return false;
+    }
+
+    return true;
+}
+
+static void set_same_origin_cors_if_needed(const httplib::Request& req,
+                                           httplib::Response& res,
+                                           int port) {
+    std::string origin = req.get_header_value("Origin");
+    if (!origin.empty() && is_allowed_webcli_origin(origin, port)) {
+        res.set_header("Access-Control-Allow-Origin", origin.c_str());
+        res.set_header("Vary", "Origin");
+    }
+}
+
+static bool is_valid_http_url(const std::string& url) {
+    bool https = url.rfind("https://", 0) == 0;
+    bool http = url.rfind("http://", 0) == 0;
+    if (!https && !http) return false;
+    std::string rest = url.substr(https ? 8 : 7);
+    if (rest.empty()) return false;
+    if (rest.find(' ') != std::string::npos || rest.find('\t') != std::string::npos) return false;
+    std::string host = rest.substr(0, rest.find('/'));
+    return !host.empty();
 }
 
 static bool tx_status_is_pending_like(const json& tx) {
@@ -304,6 +392,10 @@ static std::string parse_ou(const json& body, const std::string& fallback) {
     return fallback;
 }
 
+static bool is_octra_address(const std::string& addr) {
+    return addr.size() == 47 && addr.substr(0, 3) == "oct";
+}
+
 static constexpr size_t CIRCLE_ASSET_MAX_RAW_BYTES = 33554432;
 static constexpr size_t CIRCLE_ASSET_MAX_B64_BYTES = ((CIRCLE_ASSET_MAX_RAW_BYTES + 2) / 3) * 4;
 
@@ -347,7 +439,7 @@ static int64_t parse_amount_raw(const json& body) {
     if (integer_part.empty() && frac_part.empty()) return -1;
     for (char c : integer_part) if (c < '0' || c > '9') return -1;
     for (char c : frac_part) if (c < '0' || c > '9') return -1;
-    if (frac_part.size() > 6) frac_part = frac_part.substr(0, 6);
+    if (frac_part.size() > 6) return -1;
     while (frac_part.size() < 6) frac_part += '0';
     int64_t ip = integer_part.empty() ? 0 : std::stoll(integer_part);
     if (ip > MAX_OCT_RAW / 1000000) return -1;
@@ -1072,8 +1164,36 @@ int main(int argc, char** argv) {
     svr.set_write_timeout(300, 0);
     svr.set_keep_alive_timeout(5);
     svr.set_keep_alive_max_count(100);
+    svr.set_payload_max_length(32u * 1024u * 1024u);
 
-    svr.set_post_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+    svr.set_pre_routing_handler([port](const httplib::Request& req, httplib::Response& res) {
+        std::string reason;
+        if (!webcli_request_allowed(req, port, reason)) {
+            res.status = 403;
+            res.set_header("Content-Type", "application/json");
+            res.set_content(err_json("cross-origin webcli request blocked").dump(), "application/json");
+            fprintf(stderr, "[csrf] blocked %s %s origin=%s sec-fetch-site=%s host=%s reason=%s\n",
+                    req.method.c_str(), req.path.c_str(),
+                    req.get_header_value("Origin", "-").c_str(),
+                    req.get_header_value("Sec-Fetch-Site", "-").c_str(),
+                    req.get_header_value("Host", "-").c_str(),
+                    reason.c_str());
+            return httplib::Server::HandlerResponse::Handled;
+        }
+
+        if (starts_with(req.path, "/api/") && req.method == "OPTIONS") {
+            set_same_origin_cors_if_needed(req, res, port);
+            res.status = 204;
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers", "Content-Type");
+            res.set_header("Access-Control-Max-Age", "600");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
+    svr.set_post_routing_handler([port](const httplib::Request& req, httplib::Response& res) {
         bool is_circle_resource = req.path.rfind("/oct/", 0) == 0;
         if (!is_circle_resource) {
             res.set_header("X-Frame-Options", "DENY");
@@ -1098,6 +1218,8 @@ int main(int argc, char** argv) {
                 "frame-ancestors 'none'");
         }
         res.set_header("Cache-Control", "no-store");
+        res.headers.erase("Access-Control-Allow-Origin");
+        set_same_origin_cors_if_needed(req, res, port);
     });
 
     svr.set_mount_point("/", "static");
@@ -1161,9 +1283,9 @@ int main(int argc, char** argv) {
         std::string addr_hint = body.value("addr", "");
         std::string file_hint = body.value("file", "");
         std::string name_hint = body.value("name", "");
-        if (pin.size() != 6 || !std::all_of(pin.begin(), pin.end(), ::isdigit)) {
+        if (pin.empty()) {
             res.status = 400;
-            res.set_content(err_json("pin must be exactly 6 digits").dump(), "application/json");
+            res.set_content(err_json("pin required").dump(), "application/json");
             return;
         }
 
@@ -1263,10 +1385,13 @@ int main(int argc, char** argv) {
             return;
         }
         std::string pin = body.value("pin", "");
-        if (pin.size() != 6 || !std::all_of(pin.begin(), pin.end(), ::isdigit)) {
-            res.status = 400;
-            res.set_content(err_json("pin must be exactly 6 digits").dump(), "application/json");
-            return;
+        {
+            std::string verr = octra::validate_pin(pin);
+            if (!verr.empty()) {
+                res.status = 400;
+                res.set_content(err_json(verr).dump(), "application/json");
+                return;
+            }
         }
         std::string name = body.value("name", "wallet");
         std::string mnemonic;
@@ -1325,10 +1450,13 @@ int main(int argc, char** argv) {
             res.set_content(err_json("priv or mnemonic required").dump(), "application/json");
             return;
         }
-        if (pin.size() != 6 || !std::all_of(pin.begin(), pin.end(), ::isdigit)) {
-            res.status = 400;
-            res.set_content(err_json("pin must be exactly 6 digits").dump(), "application/json");
-            return;
+        {
+            std::string verr = octra::validate_pin(pin);
+            if (!verr.empty()) {
+                res.status = 400;
+                res.set_content(err_json(verr).dump(), "application/json");
+                return;
+            }
         }
         std::string name = body.value("name", "imported");
         bool is_mnemonic = false;
@@ -1341,7 +1469,7 @@ int main(int argc, char** argv) {
                 {
                     std::string addr_v2 = octra::addr_from_mnemonic(mn, 2);
                     std::string addr_v1 = octra::addr_from_mnemonic(mn, 1);
-                    std::string rpc_url = g_wallet_loaded ? g_wallet.rpc_url : "http://46.101.86.250:8080";
+                    std::string rpc_url = g_wallet_loaded ? g_wallet.rpc_url : "https://octra.network/rpc";
                     octra::RpcClient probe;
                     probe.set_url(rpc_url);
                     auto r2 = probe.get_balance(addr_v2);
@@ -1453,9 +1581,9 @@ int main(int argc, char** argv) {
         }
         std::string addr = body.value("addr", "");
         std::string pin = body.value("pin", "");
-        if (addr.empty() || pin.size() != 6) {
+        if (addr.empty() || pin.empty()) {
             res.status = 400;
-            res.set_content(err_json("addr and 6-digit pin required").dump(), "application/json");
+            res.set_content(err_json("addr and pin required").dump(), "application/json");
             return;
         }
         auto entries = octra::load_manifest();
@@ -1516,9 +1644,9 @@ int main(int argc, char** argv) {
         }
         std::string pin = body.value("pin", "");
         std::string name = body.value("name", "");
-        if (pin.size() != 6 || !std::all_of(pin.begin(), pin.end(), ::isdigit)) {
+        if (pin.empty()) {
             res.status = 400;
-            res.set_content(err_json("6-digit pin required").dump(), "application/json");
+            res.set_content(err_json("pin required").dump(), "application/json");
             return;
         }
         if (pin != g_pin) {
@@ -1947,17 +2075,24 @@ int main(int argc, char** argv) {
     svr.Get("/api/contract-storage", [](const httplib::Request& req, httplib::Response& res) {
         auto addr = req.get_param_value("address");
         auto key = req.get_param_value("key");
+        auto limit = req.get_param_value("limit");
         if (addr.empty() || key.empty()) {
             res.status = 400;
             res.set_content(err_json("address and key required").dump(), "application/json");
             return;
         }
-        auto r = g_rpc.contract_storage(addr, key);
+        auto r = g_rpc.contract_storage(addr, key, limit);
         json j;
-        if (r.ok && r.result.contains("value") && !r.result["value"].is_null())
+        if (r.ok && r.result.contains("value") && !r.result["value"].is_null()) {
             j["value"] = r.result["value"];
-        else
+            j["size"] = r.result.value("size", 0);
+            j["truncated"] = r.result.value("truncated", false);
+            j["limit"] = r.result.value("limit", 0);
+        } else {
             j["value"] = nullptr;
+            j["size"] = 0;
+            j["truncated"] = false;
+        }
         res.set_content(j.dump(), "application/json");
     });
 
@@ -1970,7 +2105,7 @@ int main(int argc, char** argv) {
                 return;
             }
         }
-        std::vector<std::string> ops = {"standard", "encrypt", "decrypt", "stealth", "claim", "deploy", "call"};
+        std::vector<std::string> ops = {"standard", "encrypt", "decrypt", "stealth", "claim", "deploy", "call", "program_exec", "multi_exec"};
         std::vector<std::string> methods(ops.size(), "octra_recommendedFee");
         std::vector<nlohmann::json> params;
         params.reserve(ops.size());
@@ -2260,6 +2395,12 @@ int main(int argc, char** argv) {
                 return;
             }
             pk_cache_put(to, their_signing_pk);
+        }
+        if (their_signing_pk.size() != 32 || octra::derive_address(their_signing_pk.data()) != to) {
+            pk_cache_erase(to);
+            res.status = 400;
+            res.set_content(err_json("recipient public key does not match address").dump(), "application/json");
+            return;
         }
         uint8_t their_vpub[32];
         if (!octra::ed25519_pub_to_x25519(their_signing_pk.data(), their_vpub)) {
@@ -2703,6 +2844,8 @@ int main(int argc, char** argv) {
         j["version"] = r.result.value("version", "");
         if (r.result.contains("abi")) j["abi"] = r.result["abi"];
         if (r.result.contains("disasm")) j["disasm"] = r.result["disasm"];
+        if (r.result.contains("verification")) j["verification"] = r.result["verification"];
+        if (r.result.contains("certificate")) j["certificate"] = r.result["certificate"];
         res.set_content(j.dump(), "application/json");
         } catch (const std::exception& ex) {
             res.status = 500;
@@ -2744,6 +2887,8 @@ int main(int argc, char** argv) {
         j["version"] = r.result.value("version", "");
         if (r.result.contains("abi")) j["abi"] = r.result["abi"];
         if (r.result.contains("disasm")) j["disasm"] = r.result["disasm"];
+        if (r.result.contains("verification")) j["verification"] = r.result["verification"];
+        if (r.result.contains("certificate")) j["certificate"] = r.result["certificate"];
         res.set_content(j.dump(), "application/json");
         } catch (const std::exception& ex) {
             res.status = 500;
@@ -2994,9 +3139,93 @@ int main(int argc, char** argv) {
         tx.nonce = bi.nonce + 1;
         tx.ou = parse_ou(body, "1000");
         tx.timestamp = now_ts();
-        tx.op_type = circle_id.empty() ? "call" : "circle_call";
+        tx.op_type = circle_id.empty() ? "program_exec" : "circle_call";
         tx.encrypted_data = method;
         tx.message = params_str;
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/program/multi_exec", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        if (!body.contains("calls") || !body["calls"].is_array() || body["calls"].empty()) {
+            res.status = 400;
+            res.set_content(err_json("calls array required").dump(), "application/json");
+            return;
+        }
+        if (body["calls"].size() > 8) {
+            res.status = 400;
+            res.set_content(err_json("too many calls").dump(), "application/json");
+            return;
+        }
+        json calls = json::array();
+        for (size_t i = 0; i < body["calls"].size(); ++i) {
+            const auto& item = body["calls"][i];
+            if (!item.is_object()) {
+                res.status = 400;
+                res.set_content(err_json("call must be object").dump(), "application/json");
+                return;
+            }
+            std::string target = item.value("address", "");
+            if (target.empty()) target = item.value("to", "");
+            std::string method = item.value("method", "");
+            if (!is_octra_address(target) || method.empty()) {
+                res.status = 400;
+                res.set_content(err_json("call address and method required").dump(), "application/json");
+                return;
+            }
+            json params = json::array();
+            if (item.contains("params")) {
+                if (!item["params"].is_array()) {
+                    res.status = 400;
+                    res.set_content(err_json("call params must be array").dump(), "application/json");
+                    return;
+                }
+                params = item["params"];
+            }
+            std::string amount = "0";
+            if (item.contains("amount")) {
+                if (item["amount"].is_string()) amount = item["amount"].get<std::string>();
+                else if (item["amount"].is_number_integer() || item["amount"].is_number_unsigned()) amount = item["amount"].dump();
+                else {
+                    res.status = 400;
+                    res.set_content(err_json("call amount must be string or integer").dump(), "application/json");
+                    return;
+                }
+            }
+            if (!amount.empty() && amount[0] == '-') {
+                res.status = 400;
+                res.set_content(err_json("call amount must not be negative").dump(), "application/json");
+                return;
+            }
+            calls.push_back({
+                {"to", target},
+                {"method", method},
+                {"params", params},
+                {"amount", amount.empty() ? "0" : amount}
+            });
+        }
+        json payload;
+        payload["calls"] = calls;
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = "multi_exec";
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "8000");
+        tx.timestamp = now_ts();
+        tx.op_type = "multi_exec";
+        tx.message = payload.dump();
         sign_tx_fields(tx);
         auto result = submit_tx(tx);
         if (result.contains("error")) res.status = 500;
@@ -3008,6 +3237,7 @@ int main(int argc, char** argv) {
         std::string circle_id = req.get_param_value("circle_id");
         std::string addr = req.get_param_value("address");
         std::string key = req.get_param_value("key");
+        std::string limit = req.get_param_value("limit");
         bool dump = req.has_param("dump") && req.get_param_value("dump") == "1";
         if (circle_id.empty() && (addr.empty() || key.empty())) {
             res.status = 400;
@@ -3034,7 +3264,7 @@ int main(int argc, char** argv) {
             return;
         }
         auto r = circle_id.empty()
-          ? g_rpc.contract_storage(addr, key)
+          ? g_rpc.contract_storage(addr, key, limit)
           : g_rpc.circle_storage_auth(
               circle_id,
               key,
@@ -4887,15 +5117,12 @@ int main(int argc, char** argv) {
             return;
         }
         octra::RpcClient rpc(current_public_rpc_url());
-        auto r = rpc.circle_asset_ciphertext(circle_id, path);
-        if (!r.ok) {
-            r = rpc.circle_asset_ciphertext_auth(
-                circle_id,
-                path,
-                g_wallet.addr,
-                g_wallet.pub_b64,
-                sign_circle_read_request("octra_circle_asset_ciphertext", circle_id, "path|" + path));
-        }
+        auto r = rpc.circle_asset_ciphertext_auth(
+            circle_id,
+            path,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_asset_ciphertext", circle_id, "path|" + path));
         if (!r.ok) {
             res.status = 404;
             res.set_header("Access-Control-Allow-Origin", "*");
@@ -4917,15 +5144,12 @@ int main(int argc, char** argv) {
             return;
         }
         octra::RpcClient rpc(current_public_rpc_url());
-        auto r = rpc.circle_asset_ciphertext_by_resource_key(circle_id, resource_key);
-        if (!r.ok) {
-            r = rpc.circle_asset_ciphertext_by_resource_key_auth(
-                circle_id,
-                resource_key,
-                g_wallet.addr,
-                g_wallet.pub_b64,
-                sign_circle_read_request("octra_circle_asset_ciphertext_by_resource_key", circle_id, "resource_key|" + resource_key));
-        }
+        auto r = rpc.circle_asset_ciphertext_by_resource_key_auth(
+            circle_id,
+            resource_key,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_asset_ciphertext_by_resource_key", circle_id, "resource_key|" + resource_key));
         if (!r.ok) {
             res.status = 404;
             res.set_header("Access-Control-Allow-Origin", "*");
@@ -4947,15 +5171,12 @@ int main(int argc, char** argv) {
             return;
         }
         octra::RpcClient rpc(current_public_rpc_url());
-        auto r = rpc.circle_asset_ciphertext_by_slot_ref(circle_id, slot_ref);
-        if (!r.ok) {
-            r = rpc.circle_asset_ciphertext_by_slot_ref_auth(
-                circle_id,
-                slot_ref,
-                g_wallet.addr,
-                g_wallet.pub_b64,
-                sign_circle_read_request("octra_circle_asset_ciphertext_by_slot_ref", circle_id, "slot_ref|" + slot_ref));
-        }
+        auto r = rpc.circle_asset_ciphertext_by_slot_ref_auth(
+            circle_id,
+            slot_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_asset_ciphertext_by_slot_ref", circle_id, "slot_ref|" + slot_ref));
         if (!r.ok) {
             res.status = 404;
             res.set_header("Access-Control-Allow-Origin", "*");
@@ -4977,15 +5198,12 @@ int main(int argc, char** argv) {
             return;
         }
         octra::RpcClient rpc(current_public_rpc_url());
-        auto r = rpc.circle_asset_ciphertext_by_state_ref(circle_id, state_ref);
-        if (!r.ok) {
-            r = rpc.circle_asset_ciphertext_by_state_ref_auth(
-                circle_id,
-                state_ref,
-                g_wallet.addr,
-                g_wallet.pub_b64,
-                sign_circle_read_request("octra_circle_asset_ciphertext_by_state_ref", circle_id, "state_ref|" + state_ref));
-        }
+        auto r = rpc.circle_asset_ciphertext_by_state_ref_auth(
+            circle_id,
+            state_ref,
+            g_wallet.addr,
+            g_wallet.pub_b64,
+            sign_circle_read_request("octra_circle_asset_ciphertext_by_state_ref", circle_id, "state_ref|" + state_ref));
         if (!r.ok) {
             res.status = 404;
             res.set_header("Access-Control-Allow-Origin", "*");
@@ -5018,7 +5236,7 @@ int main(int argc, char** argv) {
         auto read_optional_string = [&](const char* key) -> std::string {
             return read_string_or(key, "");
         };
-        std::string circle_id = read_string_or("circle_id", "");
+        std::string caller_circle_id = read_string_or("circle_id", "");
         std::string runtime = read_string_or("runtime", "octb");
         std::string privacy_class = read_string_or("privacy_class", "sealed");
         std::string browser_mode = read_string_or("browser_mode", "native_sealed");
@@ -5027,11 +5245,6 @@ int main(int argc, char** argv) {
         std::string policy_hash = read_optional_string("policy_hash");
         std::string members_root = read_optional_string("members_root");
         std::string export_policy = read_optional_string("export_policy");
-        if (circle_id.empty()) {
-            res.status = 400;
-            res.set_content(err_json("circle_id required").dump(), "application/json");
-            return;
-        }
         auto read_limit = [&](const char* key, const char* fallback) -> std::string {
             if (!body.contains("limits") || !body["limits"].is_object()) {
                 return fallback;
@@ -5048,22 +5261,97 @@ int main(int argc, char** argv) {
             }
             return fallback;
         };
-        json payload;
-        payload["runtime"] = runtime;
-        payload["privacy_class"] = privacy_class;
-        payload["browser_mode"] = browser_mode;
-        payload["resource_mode"] = resource_mode;
-        payload["limits"] = {
-            {"max_stable_bytes", read_limit("max_stable_bytes", "33554432")},
-            {"max_assets_bytes", read_limit("max_assets_bytes", "33554432")},
-            {"max_inline_value", read_limit("max_inline_value", "65536")},
-            {"max_wasm_bytes", read_limit("max_wasm_bytes", "33554432")}
+        std::string max_stable_bytes = read_limit("max_stable_bytes", "33554432");
+        std::string max_assets_bytes = read_limit("max_assets_bytes", "33554432");
+        std::string max_inline_value = read_limit("max_inline_value", "65536");
+        std::string max_wasm_bytes = read_limit("max_wasm_bytes", "33554432");
+        auto json_str_of = [](const std::string& s) {
+            json tmp = s;
+            return tmp.dump();
         };
-        if (!code_b64.empty()) payload["code_b64"] = code_b64;
-        if (!policy_hash.empty()) payload["policy_hash"] = policy_hash;
-        if (!members_root.empty()) payload["members_root"] = members_root;
-        if (!export_policy.empty()) payload["export_policy"] = export_policy;
+        auto str_or_null = [&json_str_of](const std::string& s) {
+            return s.empty() ? std::string("null") : json_str_of(s);
+        };
+        std::string canonical_payload;
+        canonical_payload.reserve(512);
+        canonical_payload += "{";
+        canonical_payload += "\"runtime\":" + json_str_of(runtime) + ",";
+        canonical_payload += "\"privacy_class\":" + json_str_of(privacy_class) + ",";
+        canonical_payload += "\"browser_mode\":" + json_str_of(browser_mode) + ",";
+        canonical_payload += "\"resource_mode\":" + json_str_of(resource_mode) + ",";
+        canonical_payload += "\"code_b64\":" + str_or_null(code_b64) + ",";
+        canonical_payload += "\"policy_hash\":" + str_or_null(policy_hash) + ",";
+        canonical_payload += "\"members_root\":" + str_or_null(members_root) + ",";
+        canonical_payload += "\"export_policy\":" + str_or_null(export_policy) + ",";
+        canonical_payload += "\"limits\":{";
+        canonical_payload += "\"max_stable_bytes\":\"" + max_stable_bytes + "\",";
+        canonical_payload += "\"max_assets_bytes\":\"" + max_assets_bytes + "\",";
+        canonical_payload += "\"max_inline_value\":\"" + max_inline_value + "\",";
+        canonical_payload += "\"max_wasm_bytes\":\"" + max_wasm_bytes + "\"";
+        canonical_payload += "}}";
         auto bi = get_nonce_balance();
+        uint64_t deploy_nonce = (uint64_t)(bi.nonce + 1);
+        auto h256_raw_fn = [](const std::string& tag, const std::vector<std::string>& parts) {
+            std::string buf;
+            buf.reserve(tag.size() + 1 + parts.size() * 4 + 256);
+            buf += tag;
+            buf += '\0';
+            for (const auto& p : parts) {
+                uint32_t n = (uint32_t)p.size();
+                char b[4];
+                b[0] = (char)((n >> 24) & 0xff);
+                b[1] = (char)((n >> 16) & 0xff);
+                b[2] = (char)((n >> 8) & 0xff);
+                b[3] = (char)(n & 0xff);
+                buf.append(b, 4);
+                buf += p;
+            }
+            auto h = octra::sha256(buf);
+            return std::string(reinterpret_cast<const char*>(h.data()), 32);
+        };
+        auto h256_hex_fn = [&h256_raw_fn](const std::string& tag, const std::vector<std::string>& parts) {
+            auto raw = h256_raw_fn(tag, parts);
+            static const char hc[] = "0123456789abcdef";
+            std::string out;
+            out.reserve(64);
+            for (unsigned char c : raw) {
+                out += hc[c >> 4];
+                out += hc[c & 0xf];
+            }
+            return out;
+        };
+        std::string payload_hash_hex = h256_hex_fn("octra:circle_deploy_payload:v1", {canonical_payload});
+        std::string nonce_be(8, '\0');
+        {
+            uint64_t n = deploy_nonce;
+            for (int i = 7; i >= 0; --i) { nonce_be[i] = (char)(n & 0xff); n >>= 8; }
+        }
+        std::string seed = h256_raw_fn("octra:circle_deploy_id:v1",
+            {g_wallet.addr, nonce_be, payload_hash_hex});
+        std::string b58 = octra::base58_encode(
+            reinterpret_cast<const uint8_t*>(seed.data()), seed.size());
+        std::string b58_part;
+        if (b58.size() >= 44) {
+            b58_part = b58.substr(0, 44);
+        } else if (b58.empty()) {
+            b58_part.assign(44, '1');
+        } else {
+            std::string ext = b58;
+            size_t i = 0;
+            while (ext.size() < 44) { ext += b58[i % b58.size()]; ++i; }
+            b58_part = ext.substr(0, 44);
+        }
+        std::string derived_circle_id = "oct" + b58_part;
+        if (!caller_circle_id.empty() && caller_circle_id != derived_circle_id) {
+            res.status = 400;
+            json err;
+            err["error"] = "circle_id mismatch with derived address; omit circle_id to auto-derive";
+            err["caller_circle_id"] = caller_circle_id;
+            err["derived_circle_id"] = derived_circle_id;
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        std::string circle_id = derived_circle_id;
         octra::Transaction tx;
         tx.from = g_wallet.addr;
         tx.to_ = circle_id;
@@ -5072,6 +5360,50 @@ int main(int argc, char** argv) {
         tx.ou = parse_ou(body, "200000");
         tx.timestamp = now_ts();
         tx.op_type = "deploy_circle";
+        tx.message = canonical_payload;
+        sign_tx_fields(tx);
+        auto result = submit_tx(tx);
+        if (result.contains("error")) res.status = 500;
+        else {
+            result["circle_id"] = circle_id;
+            result["derived_circle_id"] = derived_circle_id;
+        }
+        res.set_content(result.dump(), "application/json");
+    });
+
+    svr.Post("/api/circle/program_update", [](const httplib::Request& req, httplib::Response& res) {
+        WALLET_GUARD
+        std::lock_guard<std::mutex> lock(g_mtx);
+        res.set_header("Access-Control-Allow-Origin", "*");
+        json body;
+        try { body = json::parse(req.body); } catch (...) {
+            res.status = 400;
+            res.set_content(err_json("invalid json").dump(), "application/json");
+            return;
+        }
+        std::string circle_id = body.value("circle_id", "");
+        std::string code_b64 = body.value("code_b64", "");
+        if (circle_id.empty()) {
+            res.status = 400;
+            res.set_content(err_json("circle_id required").dump(), "application/json");
+            return;
+        }
+        if (code_b64.empty()) {
+            res.status = 400;
+            res.set_content(err_json("code_b64 required").dump(), "application/json");
+            return;
+        }
+        json payload;
+        payload["code_b64"] = code_b64;
+        auto bi = get_nonce_balance();
+        octra::Transaction tx;
+        tx.from = g_wallet.addr;
+        tx.to_ = circle_id;
+        tx.amount = "0";
+        tx.nonce = bi.nonce + 1;
+        tx.ou = parse_ou(body, "200000");
+        tx.timestamp = now_ts();
+        tx.op_type = "circle_program_update";
         tx.message = payload.dump();
         sign_tx_fields(tx);
         auto result = submit_tx(tx);
@@ -6100,6 +6432,18 @@ int main(int argc, char** argv) {
             return;
         }
         octra::RpcClient rpc(current_public_rpc_url());
+        auto info = rpc.circle_info(circle_id);
+        if (info.ok && info.result.value("resource_mode", "") == "sealed_read") {
+            const std::string uri = "oct://" + circle_id + path;
+            const std::string location =
+                "/circles.html?uri=" + httplib::detail::encode_query_param(uri) +
+                "&passphrase=" + httplib::detail::encode_query_param("octra-circle-demo");
+            res.status = 302;
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Cache-Control", "no-store");
+            res.set_header("Location", location);
+            return;
+        }
         auto r = rpc.circle_asset(circle_id, path);
         if (!r.ok) {
             res.status = 404;
@@ -6266,6 +6610,21 @@ int main(int argc, char** argv) {
             res.set_content(err_json("rpc_url required").dump(), "application/json");
             return;
         }
+        if (!is_valid_http_url(new_rpc)) {
+            res.status = 400;
+            res.set_content(err_json("invalid rpc_url: must be http or https with a host").dump(), "application/json");
+            return;
+        }
+        if (!new_explorer.empty() && !is_valid_http_url(new_explorer)) {
+            res.status = 400;
+            res.set_content(err_json("invalid explorer_url: must be http or https with a host").dump(), "application/json");
+            return;
+        }
+        if (!new_bridge_signer.empty() && !is_valid_http_url(new_bridge_signer)) {
+            res.status = 400;
+            res.set_content(err_json("invalid bridge_signer_url: must be http or https with a host").dump(), "application/json");
+            return;
+        }
         bool cache_cleared = false;
         try {
             std::string old_rpc = g_wallet.rpc_url;
@@ -6307,15 +6666,18 @@ int main(int argc, char** argv) {
         }
         std::string cur_pin = body.value("current_pin", "");
         std::string new_pin = body.value("new_pin", "");
-        if (cur_pin.size() != 6 || !std::all_of(cur_pin.begin(), cur_pin.end(), ::isdigit)) {
+        if (cur_pin.empty()) {
             res.status = 400;
-            res.set_content(err_json("current PIN must be 6 digits").dump(), "application/json");
+            res.set_content(err_json("current PIN required").dump(), "application/json");
             return;
         }
-        if (new_pin.size() != 6 || !std::all_of(new_pin.begin(), new_pin.end(), ::isdigit)) {
-            res.status = 400;
-            res.set_content(err_json("new PIN must be 6 digits").dump(), "application/json");
-            return;
+        {
+            std::string verr = octra::validate_pin(new_pin);
+            if (!verr.empty()) {
+                res.status = 400;
+                res.set_content(err_json("new PIN: " + verr).dump(), "application/json");
+                return;
+            }
         }
         if (cur_pin != g_pin) {
             res.status = 403;

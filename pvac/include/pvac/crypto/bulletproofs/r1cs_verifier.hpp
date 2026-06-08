@@ -22,6 +22,37 @@ struct ConstraintSystem {
     }
 };
 
+inline bool rist_valid(const RistrettoPoint& point) {
+    ExtPoint decoded;
+    return rist_decode(decoded, point);
+}
+
+inline bool ipp_points_valid(const InnerProductProof& proof) {
+    if (proof.L.size() != proof.R.size()) return false;
+    for (const auto& point : proof.L)
+        if (!rist_valid(point))
+            return false;
+    for (const auto& point : proof.R)
+        if (!rist_valid(point))
+            return false;
+    return true;
+}
+
+inline bool r1cs_points_valid(const R1CSProof& proof) {
+    if (!rist_valid(proof.A_I1)) return false;
+    if (!rist_valid(proof.A_O1)) return false;
+    if (!rist_valid(proof.S1)) return false;
+    if (!rist_valid(proof.T_1)) return false;
+    if (!rist_valid(proof.T_3)) return false;
+    if (!rist_valid(proof.T_4)) return false;
+    if (!rist_valid(proof.T_5)) return false;
+    if (!rist_valid(proof.T_6)) return false;
+    for (const auto& point : proof.V)
+        if (!rist_valid(point))
+            return false;
+    return ipp_points_valid(proof.ipp);
+}
+
 inline bool ipp_verify_with_y(
     Transcript& transcript,
     const RistrettoPoint& P,
@@ -30,6 +61,10 @@ inline bool ipp_verify_with_y(
     size_t n,
     const std::vector<Scalar>& y_inv_n
 ) {
+    if (!rist_valid(P)) return false;
+    if (!rist_valid(Q)) return false;
+    if (!ipp_points_valid(proof)) return false;
+
     size_t lg = proof.L.size();
     if (proof.R.size() != lg) return false;
     if ((1ULL << lg) != n) return false;
@@ -93,6 +128,7 @@ inline bool r1cs_verify(
     const size_t N = cs.padded_gates();
 
     if (proof.V.size() != m) return false;
+    if (!r1cs_points_valid(proof)) return false;
 
     transcript.append_u64("n", N);
     transcript.append_u64("m", m);

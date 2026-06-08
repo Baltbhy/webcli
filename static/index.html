@@ -79,8 +79,8 @@
     </div>
     <div id="modal-pin" style="display:none">
       <div class="form-row">
-        <label>enter 6-digit PIN to unlock</label>
-        <input type="password" id="modal-pin-input" maxlength="6" inputmode="numeric" placeholder="------" autocomplete="off">
+        <label id="modal-pin-label">enter PIN to unlock</label>
+        <input type="password" id="modal-pin-input" maxlength="64" placeholder="••••••••••••" autocomplete="current-password">
       </div>
       <div class="action-row">
         <button class="action-btn" onclick="modalUnlock()">unlock</button>
@@ -88,18 +88,24 @@
       </div>
     </div>
     <div id="modal-pin-setup" style="display:none">
+      <form onsubmit="return false">
+      <input type="text" autocomplete="username" value="octra-wallet" readonly aria-hidden="true" tabindex="-1" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0">
       <div class="form-row">
-        <label>create a 6-digit PIN</label>
-        <input type="password" id="modal-pin-new" maxlength="6" inputmode="numeric" placeholder="------" autocomplete="off">
+        <label>create PIN</label>
+        <input type="password" id="modal-pin-new" maxlength="64" placeholder="••••••••••••" autocomplete="new-password" passwordrules="minlength: 15;">
       </div>
       <div class="form-row">
         <label>confirm PIN</label>
-        <input type="password" id="modal-pin-confirm" maxlength="6" inputmode="numeric" placeholder="------" autocomplete="off">
+        <input type="password" id="modal-pin-confirm" maxlength="64" placeholder="••••••••••••" autocomplete="new-password" passwordrules="minlength: 15;">
+      </div>
+      <div class="form-row" style="font-size:11px;color:#8C9DB6;line-height:1.4">
+        PIN must be at least 8 characters. 15 or more recommended; your password manager can generate a strong one.
       </div>
       <div class="action-row">
-        <button class="action-btn" onclick="modalFinishSetup()">set PIN</button>
-        <button class="action-btn" style="background:#8C9DB6" onclick="modalBackFromPin()">back</button>
+        <button type="button" class="action-btn" onclick="modalFinishSetup()">set PIN</button>
+        <button type="button" class="action-btn" style="background:#8C9DB6" onclick="modalBackFromPin()">back</button>
       </div>
+      </form>
     </div>
     <div id="modal-result"></div>
   </div>
@@ -320,14 +326,16 @@
               <div class="editor-body">
                 <pre class="editor-highlight" id="ct-highlight"></pre>
                 <textarea id="ct-source" class="code-editor" rows="14" oninput="editorUpdateWithLiveCompile()" onscroll="editorSync()" placeholder="contract Token {
-  state { name: string, balances: map[address]int }
-  constructor(n: string, supply: int) {
+  state { name: string, balances: map[address]u128 }
+  constructor(n: string, supply: u128) {
+    require(supply > 0, &quot;supply must be positive&quot;)
     self.name = n
     self.balances[origin] = supply
   }
-  fn transfer(to: address, amt: int): bool {
+  fn transfer(to: address, amt: u128): bool {
+    require(amt > 0, &quot;amount must be positive&quot;)
     let bal = self.balances[caller]
-    assert bal >= amt
+    require(bal >= amt, &quot;insufficient balance&quot;)
     self.balances[caller] = bal - amt
     self.balances[to] = self.balances[to] + amt
     return true
@@ -351,12 +359,16 @@
 
           <div class="ide-bottom-tabs">
             <button class="ide-bottom-tab active" data-panel="abi" onclick="switchBottomTab('abi')">ABI</button>
+            <button class="ide-bottom-tab" data-panel="verify" onclick="switchBottomTab('verify')">Verify</button>
             <button class="ide-bottom-tab" data-panel="disasm" onclick="switchBottomTab('disasm')">Assembly</button>
             <button class="ide-bottom-tab" data-panel="console" onclick="switchBottomTab('console')">Console</button>
             <button class="ide-bottom-tab" data-panel="storage" onclick="switchBottomTab('storage')">Storage</button>
           </div>
           <div id="ct-abi-display" class="ide-bottom-panel active" style="display:none">
             <pre id="ct-abi-json" class="code-editor" style="font-size:11px;max-height:250px;overflow:auto;padding:8px"></pre>
+          </div>
+          <div id="ct-verify-display" class="ide-bottom-panel" style="display:none">
+            <div id="ct-verify-output" class="console-output" style="font-family:monospace;font-size:12px"><div class="panel-empty">compile AppliedML to view formal verification trace</div></div>
           </div>
           <div id="ct-disasm-display" class="ide-bottom-panel" style="display:none">
             <pre id="ct-disasm-code" class="code-editor disasm-view" style="font-size:11px;max-height:250px;overflow:auto;padding:8px;color:#2C3E50"><span class="panel-empty">compile a contract to view assembly</span></pre>
@@ -519,21 +531,27 @@
     </div>
     <div class="section-title">change PIN</div>
     <div class="form-area">
+      <form onsubmit="return false">
+      <input type="text" autocomplete="username" value="octra-wallet" readonly aria-hidden="true" tabindex="-1" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0">
       <div class="form-row">
         <label>current PIN</label>
-        <input type="password" id="pin-current" maxlength="6" inputmode="numeric" placeholder="------" autocomplete="off">
+        <input type="password" id="pin-current" maxlength="64" placeholder="••••••••••••" autocomplete="current-password">
       </div>
       <div class="form-row">
         <label>new PIN</label>
-        <input type="password" id="pin-new" maxlength="6" inputmode="numeric" placeholder="------" autocomplete="off">
+        <input type="password" id="pin-new" maxlength="64" placeholder="••••••••••••" autocomplete="new-password" passwordrules="minlength: 15;">
       </div>
       <div class="form-row">
         <label>confirm new PIN</label>
-        <input type="password" id="pin-confirm-new" maxlength="6" inputmode="numeric" placeholder="------" autocomplete="off">
+        <input type="password" id="pin-confirm-new" maxlength="64" placeholder="••••••••••••" autocomplete="new-password" passwordrules="minlength: 15;">
+      </div>
+      <div class="form-row" style="font-size:11px;color:#8C9DB6;line-height:1.4">
+        new PIN must be at least 8 characters. 15 or more recommended; your password manager can generate a strong one.
       </div>
       <div class="action-row">
-        <button class="action-btn" onclick="doChangePin()">change PIN</button>
+        <button type="button" class="action-btn" onclick="doChangePin()">change PIN</button>
       </div>
+      </form>
       <div id="pin-change-result"></div>
     </div>
   </div>

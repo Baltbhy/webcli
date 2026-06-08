@@ -332,6 +332,26 @@ inline void keypair_from_seed(const uint8_t seed[32], uint8_t sk[64], uint8_t pk
     crypto_sign_seed_keypair(pk, sk, seed);
 }
 
+inline std::string validate_pin(const std::string& pin) {
+    if (pin.empty()) return "PIN required";
+    if (pin.size() < 8) return "PIN must be at least 8 characters";
+    if (pin.size() > 64) return "PIN too long (max 64 characters)";
+    if (pin.size() < 15) {
+        bool has_letter = false;
+        bool has_digit = false;
+        bool has_symbol = false;
+        for (unsigned char c : pin) {
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) has_letter = true;
+            else if (c >= '0' && c <= '9') has_digit = true;
+            else has_symbol = true;
+        }
+        if (!has_letter || !has_digit || !has_symbol) {
+            return "under 15 chars: must include a letter, a digit and a special symbol";
+        }
+    }
+    return "";
+}
+
 inline std::array<uint8_t, 32> derive_key_from_pin(
     const std::string& pin, const uint8_t salt[32], int iterations = 600000) {
     std::array<uint8_t, 32> key;
