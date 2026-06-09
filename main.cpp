@@ -3061,7 +3061,6 @@ int main(int argc, char** argv) {
             res.set_content(err_json("address and method required").dump(), "application/json");
             return;
         }
-        if (!wallet_pin_ok(body, res)) return;
         std::string params_str = "[]";
         if (body.contains("params")) params_str = body["params"].dump();
         std::string amount_str = body.value("amount", "0");
